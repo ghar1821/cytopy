@@ -28,13 +28,14 @@ def test_layers_exist(cv):
     assert set(cv.viewer.layers) >= set()
     names = [layer.name for layer in cv.viewer.layers]
     assert names == [
-        "colour bar",
-        "axes",
-        "axis labels",
-        "gates",
-        "bead gate",
         "panel 1",
         "panel 1 curves",
+        "axes",
+        "axis labels",
+        "y axis label",
+        "applied gates",
+        "bead gate",
+        "gates",
     ]
 
 
@@ -46,7 +47,10 @@ def test_density_image_is_populated(cv):
 
 
 def _labels(cv):
-    return list(cv.viewer.layers["axis labels"].text.string.array)
+    """Every label on the canvas, including the y axis on its own layer."""
+    return list(cv.viewer.layers["axis labels"].text.string.array) + list(
+        cv.viewer.layers["y axis label"].text.string.array
+    )
 
 
 def test_axis_labels_are_raw_units_for_a_transformed_layer(cv):
@@ -67,7 +71,6 @@ def test_linear_ticks_label_the_stored_values(cv):
 
     assert isinstance(cv.x_scale, PretransformedScale)
     cv.w_ticks.value = "linear"
-    cv.w_colorbar.value = False  # its "100%" is not an axis label
     assert isinstance(cv.x_scale, LinearScale)
     # stored values are single-digit arcsinh units, not decades of raw signal
     assert not any(lbl.startswith("10") for lbl in _labels(cv))
@@ -129,7 +132,8 @@ def test_gate_from_a_rectangle(cv):
 
 def test_gate_hierarchy_intersects_with_parent(cv):
     b = cv.bins
-    cv.w_robust.value = False  # so a full-canvas rectangle really does catch everything
+    cv._robust = False  # so a full-canvas rectangle really does catch everything
+    cv.refresh()
     gates = cv.viewer.layers["gates"]
     gates.add_rectangles(np.array([[0, 0], [0, b], [b, b], [b, 0]]))
     cv.w_gate_name.value = "all"
@@ -167,10 +171,11 @@ def test_gate_without_shapes_is_a_no_op(cv):
     assert "draw a shape" in cv.w_status.value
 
 
-def test_robust_limits_trim_the_axis_range(cv):
-    cv.w_robust.value = True
+def test_the_axes_always_trim_the_extremes(cv):
+    """Not a setting any more: a single extreme event flattens the plot without it."""
     tight = cv.axes.x_hi - cv.axes.x_lo
-    cv.w_robust.value = False
+    cv._robust = False
+    cv.refresh()
     assert cv.axes.x_hi - cv.axes.x_lo > tight
 
 
@@ -343,11 +348,8 @@ def test_decorations_flip_with_the_background(demo, make_napari_viewer):
     cv = CytoViewer(demo, layer="asinh", bins=64, viewer=make_napari_viewer())
 
     def text_colour():
-        return np.asarray(
-            cv.labels.text.color.constant
-            if hasattr(cv.labels.text.color, "constant")
-            else cv.labels.text.color
-        )[:3]
+        # Per-point now, since gate labels get a colour of their own.
+        return np.asarray(cv.labels.text.color.array)[0][:3]
 
     light_text = text_colour().copy()
     light_grid = np.asarray(cv.grid.edge_color[0])[:3].copy()
@@ -470,11 +472,11 @@ def test_viewer_opens_on_several_samples(demo, demo_path, make_napari_viewer):
         viewer=make_napari_viewer(),
     )
     assert cv.adata.n_obs == 120_000
-    assert list(cv.w_sample.choices) == ["<all>", "demo", "run2"]
+    assert list(cv.w_samples.choices) == ["demo", "run2"]
     assert cv.w_lock.value is True  # locked once there is more than one
 
-    cv.w_sample.value = "run2"
-    assert cv.panel.sample == "run2"
+    cv.w_samples.value = ["run2"]
+    assert cv.panel.samples == ("run2",)
     assert int(cv.selection_mask().sum()) == 60_000
     assert int(cv.selection_mask(sample=False).sum()) == 120_000
 
@@ -488,9 +490,9 @@ def test_axes_stay_put_between_samples(demo, demo_path, make_napari_viewer):
     dim.X = dim.X * np.float32(0.25)
     cv = CytoViewer([demo, dim], x="CD3", y="CD19", bins=64, viewer=make_napari_viewer())
 
-    cv.w_sample.value = "demo"
+    cv.w_samples.value = ["demo"]
     locked = (cv.axes.x_lo, cv.axes.x_hi)
-    cv.w_sample.value = "dim"
+    cv.w_samples.value = ["dim"]
     assert (cv.axes.x_lo, cv.axes.x_hi) == locked  # same axes, so they compare
 
     cv.w_lock.value = False
@@ -498,7 +500,7 @@ def test_axes_stay_put_between_samples(demo, demo_path, make_napari_viewer):
 
 
 def test_a_single_sample_is_not_locked_by_default(cv):
-    assert list(cv.w_sample.choices) == ["<all>", "demo"]
+    assert list(cv.w_samples.choices) == ["demo"]
     assert cv.w_lock.value is False
 
 
@@ -506,8 +508,8 @@ def test_a_single_sample_is_not_locked_by_default(cv):
 # gate hierarchies
 # --------------------------------------------------------------------------
 def _rect(cv, x_lo, x_hi, y_lo, y_hi):
-    """A rectangle given in data coordinates, as canvas pixels."""
-    return cv.axes.to_pixels(np.array([x_lo, x_lo, x_hi, x_hi]), np.array([y_lo, y_hi, y_hi, y_lo]))
+    """A rectangle given in data coordinates, as canvas coordinates."""
+    return cv.to_canvas(np.array([x_lo, x_lo, x_hi, x_hi]), np.array([y_lo, y_hi, y_hi, y_lo]))
 
 
 def _truth(adata, layer, x, y, box):
@@ -528,7 +530,8 @@ def test_a_child_gate_counts_only_what_was_drawn_for_it(cv):
     parent_box = (2.0, 9.0, -2.0, 9.0)
     cv.gates.add_polygons([_rect(cv, *parent_box)])
     cv.apply_gate("parent")
-    assert len(cv.gates.data) == 0  # committed, so the canvas clears
+    assert len(cv.gates.data) == 0  # committed: it moves to the applied layer
+    assert len(cv.applied.data) == 1
 
     child_box = (3.0, 5.0, 0.0, 2.0)
     cv.w_parent.value = "parent"
@@ -558,7 +561,7 @@ def test_two_shapes_still_make_one_gate(cv):
 
 @pytest.mark.parametrize(
     ("change", "value"),
-    [("w_bins", 128), ("w_parent", "seed"), ("w_robust", False), ("w_y", "CD8 (APC-A)")],
+    [("w_bins", 128), ("w_parent", "seed"), ("w_y", "CD8 (APC-A)")],
 )
 def test_a_shape_keeps_its_data_meaning_when_the_axes_move(cv, change, value):
     """The shape lives in pixels but means data; a rescale must not shift it."""
@@ -583,7 +586,6 @@ def test_shape_types_survive_being_reprojected(cv):
 
 def test_events_off_the_axes_are_reported_not_hidden(cv):
     """Robust limits clip the axes, so a few events are drawn nowhere."""
-    assert cv.w_robust.value is True
     off = cv.off_axis_count()
     assert off > 0
 
@@ -591,7 +593,8 @@ def test_events_off_the_axes_are_reported_not_hidden(cv):
     cv.apply_gate("g")
     assert f"{off:,} outside the axes" in cv.w_status.value
 
-    cv.w_robust.value = False
+    cv._robust = False
+    cv.refresh()
     assert cv.off_axis_count() == 0  # the full range holds everything
 
 
@@ -619,63 +622,6 @@ def pair(demo, demo_path, make_napari_viewer):
 # --------------------------------------------------------------------------
 # the colour bar
 # --------------------------------------------------------------------------
-def test_the_colour_bar_is_drawn_by_default(cv):
-    assert cv.w_colorbar.value is True
-    assert cv.colorbar.visible is True
-    assert cv.colorbar.data.shape[0] == cv.bins
-    # It sits to the right of the plot, and shares its scale.
-    assert cv.colorbar.translate[1] > cv.bins
-    assert cv.colorbar.contrast_limits == cv.density.contrast_limits
-
-
-def test_the_bar_runs_bright_at_the_top(cv):
-    column = np.asarray(cv.colorbar.data)[:, 0]
-    assert column[0] == pytest.approx(cv.density.contrast_limits[1])
-    assert column[-1] == 0.0
-
-
-def test_the_bar_is_labelled_as_a_share_of_the_peak(cv):
-    """Events per bin is a property of the grid, not the data.
-
-    The same events in the same channels peak at ~470 per bin at 64 bins and
-    ~5 at 1024, so labelling the bar with counts made the numbers lurch about
-    whenever the bins or the channels changed. A share of the peak holds still.
-    """
-    labels = [str(t) for t in cv.labels.text.string.array]
-    for tick in ("0%", "25%", "50%", "75%", "100%"):
-        assert tick in labels
-    assert "of peak" in labels
-
-    peak = cv.peak_density()
-    assert peak > 0
-    assert f"peak {peak:,.0f}" in cv.w_status.value
-
-    # The ticks hold still across a change that moves the peak a long way.
-    cv.w_bins.value = 64
-    assert cv.peak_density() > peak * 2
-    assert all(t in [str(x) for x in cv.labels.text.string.array] for t in ("0%", "100%"))
-
-
-def test_the_peak_follows_the_data_not_the_labels(cv):
-    before = cv.peak_density()
-    cv.w_x.value = "CD8 (APC-A)"
-    after = cv.peak_density()
-    assert before != after  # the absolute number does move ...
-    labels = [str(t) for t in cv.labels.text.string.array]
-    assert "100%" in labels and "of peak" in labels  # ... the bar does not
-
-
-def test_the_colour_bar_can_be_turned_off(cv):
-    cv.w_colorbar.value = False
-    assert cv.colorbar.visible is False
-    labels = [str(t) for t in cv.labels.text.string.array]
-    assert "smoothed" not in labels and "events/bin" not in labels
-
-
-def test_the_bar_moves_past_the_last_panel(pair):
-    alone = pair.colorbar.translate[1]
-    pair.add_panel("density")
-    assert pair.colorbar.translate[1] > alone
 
 
 # --------------------------------------------------------------------------
@@ -686,7 +632,6 @@ def test_histogram_swaps_the_density_out(pair):
     assert pair.histogram is True
     assert pair.curves.visible is True
     assert pair.density.visible is False
-    assert pair.colorbar.visible is False
 
     pair.w_plot.value = "density"
     assert pair.density.visible is True
@@ -698,8 +643,8 @@ def test_one_curve_per_sample(pair):
     groups = pair.histogram_groups()
     assert [name for name, _ in groups] == ["demo", "dim"]
     assert all(int(mask.sum()) == 60_000 for _, mask in groups)
-    # two curves, plus a legend rule for each
-    assert len(pair.curves.data) == 4
+    # a fill and a line per curve, plus a legend rule for each
+    assert len(pair.curves.data) == 6
     labels = [str(t) for t in pair.labels.text.string.array]
     assert "demo (60,000)" in labels and "dim (60,000)" in labels
     assert "2 curve(s)" in pair.w_status.value
@@ -717,11 +662,11 @@ def test_the_curves_follow_the_data(pair):
     assert peak_x(1) < peak_x(0)
 
 
-def test_the_sample_selector_narrows_to_one_curve(pair):
+def test_the_sample_list_narrows_to_one_curve(pair):
     pair.w_plot.value = "histogram"
-    pair.w_sample.value = "dim"
+    pair.w_samples.value = ["dim"]
     assert [name for name, _ in pair.histogram_groups()] == ["dim"]
-    assert len(pair.curves.data) == 2  # one curve, one legend rule
+    assert len(pair.curves.data) == 3  # one fill, one line, one legend rule
 
 
 def test_the_parent_gate_applies_to_the_curves(cv):
@@ -736,25 +681,32 @@ def test_the_parent_gate_applies_to_the_curves(cv):
 
 def test_the_y_axis_is_a_density_not_a_channel(pair):
     pair.w_plot.value = "histogram"
-    labels = [str(t) for t in pair.labels.text.string.array]
-    assert "density" in labels
+    labels = _labels(pair)
+    assert "% of mode" in labels
     assert "CD19 (PE-A)" not in labels  # the y channel means nothing here
     assert "CD3 (FITC-A)" in labels  # ... but the x channel still does
 
-    pair.w_peak.value = True
-    assert "peak" in [str(t) for t in pair.labels.text.string.array]
+    assert {"0", "50", "100"} <= set(_labels(pair))
 
 
-def test_curves_are_densities_so_samples_compare(pair):
-    """Unit area, so a bigger sample does not simply draw a taller curve."""
-    from cytopy.density import density_curve
+def test_every_curve_peaks_at_a_hundred(three):
+    """Per cent of mode, the flow convention: a rare population is still legible."""
+    from cytopy.viewer import _MODE_TOP
 
-    pair.w_plot.value = "histogram"
-    _, mask = pair.histogram_groups()[0]
-    values = pair._column(pair.w_x.value, mask)
-    curve = density_curve(values, pair.axes.x_lo, pair.axes.x_hi, pair.bins)
-    width = (pair.axes.x_hi - pair.axes.x_lo) / pair.bins
-    assert curve.sum() * width == pytest.approx(1.0, abs=0.02)
+    three.w_samples.value = ["demo", "c"]
+    groups = three.histogram_groups()
+    floor = three.bins - 1
+    scale = (three.bins - 1) / (_MODE_TOP * 1.05)
+
+    for index in range(len(groups)):
+        line = np.asarray(three.curves.data[len(groups) + index])  # fills come first
+        peak = (floor - line[:, 0].min()) / scale
+        assert peak == pytest.approx(_MODE_TOP, abs=0.01)
+
+    labels = _labels(three)
+    assert "% of mode" in labels
+    for tick in ("0", "25", "50", "75", "100"):
+        assert tick in labels
 
 
 def test_a_shape_gates_an_interval_on_a_histogram(cv):
@@ -774,12 +726,9 @@ def test_a_shape_gates_an_interval_on_a_histogram(cv):
 def test_settings_that_do_not_apply_are_greyed_out(pair):
     pair.w_plot.value = "histogram"
     assert pair.w_y.enabled is False
-    assert pair.w_colorbar.enabled is False
-    assert pair.w_peak.enabled is True
 
     pair.w_plot.value = "density"
     assert pair.w_y.enabled is True
-    assert pair.w_peak.enabled is False
 
 
 def test_an_empty_selection_draws_nothing(cv):
@@ -794,125 +743,377 @@ def test_an_empty_selection_draws_nothing(cv):
 # --------------------------------------------------------------------------
 # panels
 # --------------------------------------------------------------------------
-def test_a_viewer_starts_with_one_panel(cv):
-    assert len(cv.panels) == 1
-    assert cv.active == 0
-    assert cv.panel is cv.panels[0]
-    assert cv.density is cv.panel.image  # the old name still points at the active one
-    assert cv.axes is cv.panel.axes
 
 
-def test_each_panel_is_its_own_napari_layer(cv):
-    """What duplicating the density layer was reaching for."""
-    cv.add_panel("density")
-    names = [layer.name for layer in cv.viewer.layers]
-    assert "panel 1" in names and "panel 2" in names
-    assert cv.panels[0].image is not cv.panels[1].image
-    # hiding one leaves the other alone
-    cv.panels[0].image.visible = False
-    cv.refresh()
-    assert cv.panels[1].image.visible is True
+# --------------------------------------------------------------------------
+# revisiting a gate
+# --------------------------------------------------------------------------
+def _make_hierarchy(cv):
+    cv.gates.add_polygons([_rect(cv, 2.0, 9.0, -2.0, 9.0)])
+    cv.apply_gate("parent")
+    cv.w_parent.value = "parent"
+    cv.gates.add_polygons([_rect(cv, 3.0, 6.0, 0.0, 4.0)])
+    cv.apply_gate("child", parent="parent")
+    return int(cv.adata.obs["parent"].sum()), int(cv.adata.obs["child"].sum())
 
 
-def test_panels_can_be_density_or_histogram(cv):
-    cv.add_panel("histogram", x="CD8 (APC-A)")
-    assert [p.kind for p in cv.panels] == ["density", "histogram"]
-    assert cv.panels[0].image.visible and not cv.panels[0].curves.visible
-    assert cv.panels[1].curves.visible and not cv.panels[1].image.visible
+def test_a_stored_gate_recomputes_to_exactly_what_was_drawn(cv):
+    """The canvas maps data to pixels affinely, so the inside of a shape is the same."""
+    import cytopy
+
+    _make_hierarchy(cv)
+    for name in ("parent", "child"):
+        assert np.array_equal(cytopy.gate_mask(cv.adata, name), cv.adata.obs[name].to_numpy())
 
 
-def test_a_new_panel_copies_the_active_one_then_diverges(cv):
-    cv.w_x.value = "CD8 (APC-A)"
-    cv.add_panel("density")
-    assert cv.panels[1].x == "CD8 (APC-A)"  # starts from what you were looking at
-    cv.w_y.value = "FSC-A"
-    assert cv.panels[1].y == "FSC-A"
-    assert cv.panels[0].y == "CD19 (PE-A)"  # ... and does not drag the first along
+def test_a_gate_can_be_put_back_on_the_canvas(cv):
+    _make_hierarchy(cv)
+    cv.w_x.value = "CD8 (APC-A)"  # wander off somewhere else first
+    cv.gates.data = []
+
+    cv.load_gate("child")
+    assert len(cv.gates.data) == 1
+    assert cv.w_gate_name.value == "child"
+    assert cv.w_x.value == "CD3 (FITC-A)"  # back in the plane it was drawn in
+    assert cv.w_y.value == "CD19 (PE-A)"
+    assert cv.w_parent.value == "parent"  # its own parent, not itself
 
 
-def test_clicking_a_panel_rebinds_the_settings(cv):
-    cv.add_panel("density", x="CD8 (APC-A)", y="FSC-A")
-    assert cv.active == 1
-    first = cv.panels[0]
-
-    assert cv._panel_at(first.row + 10, first.col + 10) == 0
-    cv.select_panel(0)
-    assert (cv.w_x.value, cv.w_y.value) == ("CD3 (FITC-A)", "CD19 (PE-A)")
-    cv.select_panel(1)
-    assert (cv.w_x.value, cv.w_y.value) == ("CD8 (APC-A)", "FSC-A")
-    assert cv.w_panel.value == "2"
+def test_reapplying_an_untouched_gate_changes_nothing(cv):
+    before = _make_hierarchy(cv)
+    cv.load_gate("parent")
+    cv.apply_gate("parent")
+    after = (int(cv.adata.obs["parent"].sum()), int(cv.adata.obs["child"].sum()))
+    assert after == before
 
 
-def test_clicking_outside_every_panel_changes_nothing(cv):
-    cv.add_panel("density")
-    assert cv._panel_at(-10_000, -10_000) is None
+def test_adjusting_a_gate_brings_its_children_along(cv):
+    """A child was worked out against the old outline; it is stale until recomputed."""
+    import cytopy
+
+    _, child_before = _make_hierarchy(cv)
+    cv.load_gate("parent")
+    cv.gates.data = []
+    cv.gates.add_polygons([_rect(cv, 4.0, 9.0, -2.0, 9.0)])  # smaller
+    cv.apply_gate("parent")
+
+    assert int(cv.adata.obs["child"].sum()) < child_before
+    assert np.array_equal(cytopy.gate_mask(cv.adata, "child"), cv.adata.obs["child"].to_numpy())
+    assert not (cv.adata.obs["child"] & ~cv.adata.obs["parent"]).any()
+    assert "recomputed child" in cv.w_status.value
 
 
-def test_display_settings_apply_to_every_panel(cv):
-    """bins, colormap and the rest are global; the plot settings are not."""
-    cv.add_panel("density", x="CD8 (APC-A)")
-    cv.w_bins.value = 64
-    assert all(p.axes.bins == 64 for p in cv.panels)
-    assert all(np.asarray(p.image.data).shape == (64, 64) for p in cv.panels)
+def test_a_grandchild_is_recomputed_too(cv):
+    import cytopy
+
+    _make_hierarchy(cv)
+    cv.w_parent.value = "child"
+    cv.gates.add_polygons([_rect(cv, 3.5, 5.5, 0.5, 3.5)])
+    cv.apply_gate("grandchild", parent="child")
+
+    cv.load_gate("parent")
+    cv.gates.data = []
+    cv.gates.add_polygons([_rect(cv, 4.0, 9.0, -2.0, 9.0)])
+    cv.apply_gate("parent")
+
+    assert cytopy.gate_children(cv.adata, "child") == ["grandchild"]
+    assert np.array_equal(
+        cytopy.gate_mask(cv.adata, "grandchild"), cv.adata.obs["grandchild"].to_numpy()
+    )
+    assert not (cv.adata.obs["grandchild"] & ~cv.adata.obs["parent"]).any()
 
 
-def test_panels_share_one_intensity_scale(cv):
-    cv.add_panel("density", x="CD8 (APC-A)", y="FSC-A")
-    limits = [tuple(p.image.contrast_limits) for p in cv.panels]
-    assert limits[0] == limits[1]
+def test_deleting_a_gate_takes_its_children_with_it(cv):
+    _make_hierarchy(cv)
+    assert cv.delete_gate("parent") == ["parent", "child"]
+    assert "parent" not in cv.adata.obs and "child" not in cv.adata.obs
+    assert "parent" not in cv.adata.uns["cytopy"]["gates"]
+    assert list(cv.w_gate_pick.choices) == ["<none>"]
 
 
-def test_arrange_tiles_the_panels(cv):
-    for _ in range(3):
-        cv.add_panel("density")
-    cv.panels[1].row += 5_000
-    cv.arrange()
-    positions = [(round(p.row), round(p.col)) for p in cv.panels]
-    assert len(set(positions)) == 4  # no two on top of each other
-    assert positions[0] == (0, 0)
-    step = round(cv.bins * 1.12)
-    assert positions[1] == (0, step)
+def test_deleting_a_gate_a_panel_was_using_frees_the_panel(cv):
+    _make_hierarchy(cv)
+    cv.w_parent.value = "parent"
+    cv.delete_gate("parent")
+    assert cv.panel.parent == "<none>"
 
 
-def test_a_panel_can_be_moved_and_its_box_follows(cv):
-    cv.add_panel("density")
-    panel = cv.panels[1]
-    panel.row, panel.col = 500.0, 700.0
-    cv.refresh()
-    assert tuple(panel.image.translate) == (500.0, 700.0)
-    # the frame is redrawn around the new position
-    frame = np.vstack([np.asarray(line) for line in cv.grid.data])
-    assert frame[:, 0].max() >= 500.0
-    assert frame[:, 1].max() >= 700.0
+def test_a_gate_with_no_outline_cannot_be_adjusted(cv):
+    import cytopy
+
+    cytopy.add_gate(cv.adata, "from a mask", np.ones(cv.adata.n_obs, dtype=bool))
+    with pytest.raises(KeyError, match="no outline"):
+        cv.load_gate("from a mask")
+    with pytest.raises(KeyError, match="no gate"):
+        cv.load_gate("never drawn")
 
 
-def test_panels_stacked_on_one_spot_overlay_with_the_denser_winning(cv):
-    """Drag one panel onto another and neither should bury the other."""
-    cv.add_panel("density", sample="<all>")
-    cv.panels[1].row, cv.panels[1].col = cv.panels[0].row, cv.panels[0].col
-    cv.w_x.value = "CD8 (APC-A)"  # different data, same place
-    cv.refresh()
-
-    a = np.asarray(cv.panels[0].image.data)
-    b = np.asarray(cv.panels[1].image.data)
-    assert not ((a > 0) & (b > 0)).any()
-    assert (a > 0).any() and (b > 0).any()
+def test_a_gate_cannot_be_its_own_parent(cv):
+    _make_hierarchy(cv)
+    cv.load_gate("child")
+    cv._updating = True
+    cv.w_parent.value = "child"
+    cv._updating = False
+    cv.gates.add_polygons([_rect(cv, 3.0, 6.0, 0.0, 4.0)])
+    cv._apply_gate()
+    assert "own parent" in cv.w_status.value
 
 
-def test_the_last_panel_cannot_be_removed(cv):
-    with pytest.raises(ValueError, match="at least one panel"):
-        cv.remove_panel()
-    cv.add_panel("density")
-    cv.remove_panel()
-    assert len(cv.panels) == 1
-    assert "panel 2" not in [layer.name for layer in cv.viewer.layers]
+# --------------------------------------------------------------------------
+# applied gates stay on screen
+# --------------------------------------------------------------------------
+def test_an_applied_gate_stays_visible_and_labelled(cv):
+    cv.gates.add_polygons([_rect(cv, 2.0, 9.0, -2.0, 9.0)])
+    cv.apply_gate("lymphs")
+
+    assert len(cv.gates.data) == 0  # the editable layer is clear ...
+    assert len(cv.applied.data) == 1  # ... and the gate is still on screen
+    assert cv.applied.visible is True
+    n = int(cv.adata.obs["lymphs"].sum())
+    # The label goes on the text layer, which is the one that draws.
+    assert f"lymphs  {100 * n / cv.adata.n_obs:.1f}%" in [
+        str(t) for t in cv.labels.text.string.array
+    ]
 
 
-def test_gates_are_drawn_against_the_active_panel(cv):
-    cv.add_panel("density", x="CD8 (APC-A)", y="FSC-A")
-    cv.select_panel(0)
-    cv.gates.add_polygons([_rect(cv, 3.0, 9.0, -2.0, 9.0)])
-    cv.apply_gate("on panel 1")
+def test_the_label_is_a_share_of_its_own_parent(cv):
+    """Not of whatever the panel shows, or the same gate would read differently."""
+    _make_hierarchy(cv)
+    parent_n = int(cv.adata.obs["parent"].sum())
+    child_n = int(cv.adata.obs["child"].sum())
+    labels = [str(t) for t in cv.labels.text.string.array if "%" in str(t) and "  " in str(t)]
+    assert f"parent  {100 * parent_n / cv.adata.n_obs:.1f}%" in labels
+    assert f"child  {100 * child_n / parent_n:.1f}%" in labels
 
-    expected = _truth(cv.adata, "asinh", "CD3", "CD19", (3.0, 9.0, -2.0, 9.0))
-    assert int(cv.adata.obs["on panel 1"].sum()) == int(expected.sum())
+    # switching the panel's parent gate must not move the numbers
+    cv.w_parent.value = "parent"
+    after = [str(t) for t in cv.labels.text.string.array if "%" in str(t) and "  " in str(t)]
+    assert after == labels
+
+
+def test_applied_gates_do_not_join_the_next_one(cv):
+    """They are on their own layer, so the union bug cannot come back."""
+    first = (2.0, 3.0, -2.0, 9.0)
+    second = (6.0, 7.0, -2.0, 9.0)
+    cv.gates.add_polygons([_rect(cv, *first)])
+    cv.apply_gate("one")
+    cv.gates.add_polygons([_rect(cv, *second)])
+    cv.apply_gate("two")
+
+    expected = _truth(cv.adata, "asinh", "CD3", "CD19", second)
+    assert int(cv.adata.obs["two"].sum()) == int(expected.sum())
+    assert len(cv.applied.data) == 2
+
+
+def test_gates_belong_to_the_plane_they_were_drawn_in(cv):
+    cv.gates.add_polygons([_rect(cv, 2.0, 9.0, -2.0, 9.0)])
+    cv.apply_gate("here")
+    assert cv.applied.visible is True
+    cv.w_y.value = "CD8 (APC-A)"
+    assert len(cv.applied.data) == 0  # a different plane, so nothing to outline
+    cv.w_y.value = "CD19 (PE-A)"
+    assert len(cv.applied.data) == 1
+
+
+# --------------------------------------------------------------------------
+# widget choices survive napari resetting them
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# gating on a panel that is not at the origin
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# gate labels
+# --------------------------------------------------------------------------
+def test_gate_labels_are_drawn_on_the_text_layer(cv):
+    """On the shapes layer they did not show; the text layer is the one that draws."""
+    _make_hierarchy(cv)
+    labels = [str(t) for t in cv.labels.text.string.array]
+    parent_n = int(cv.adata.obs["parent"].sum())
+    child_n = int(cv.adata.obs["child"].sum())
+    assert f"parent  {100 * parent_n / cv.adata.n_obs:.1f}%" in labels
+    assert f"child  {100 * child_n / parent_n:.1f}%" in labels
+
+
+def test_gate_labels_stand_out_from_the_background(cv):
+    """A pale blue label is invisible on white, which is why this follows it."""
+    _make_hierarchy(cv)
+    colours = np.asarray(cv.labels.text.color.array)
+    assert len(np.unique(colours, axis=0)) == 2  # axis text and gate text differ
+
+    on_white = colours[-1].copy()
+    cv.set_background("black")
+    on_black = np.asarray(cv.labels.text.color.array)[-1]
+    assert on_white[:3].mean() < 0.5 < on_black[:3].mean()
+    assert np.asarray(cv.applied.edge_color)[0][:3].mean() > 0.5
+
+
+def test_a_label_sits_by_its_own_outline(cv):
+    cv.gates.add_polygons([_rect(cv, 3.0, 6.0, 0.0, 4.0)])
+    cv.apply_gate("g")
+    (row, col, label) = cv._gate_labels[0]
+    corners = np.asarray(cv.applied.data[0])
+    assert label.startswith("g  ")
+    assert abs(col - corners[:, 1].min()) < 1.0
+    assert row < corners[:, 0].min()  # just above it
+
+
+def test_the_y_label_reads_up_the_side(cv):
+    from cytopy.viewer import Y_LABEL_ROTATION
+
+    assert Y_LABEL_ROTATION == 270
+    assert cv.ylabel.text.rotation == Y_LABEL_ROTATION
+    assert list(cv.ylabel.text.string.array) == ["CD19 (PE-A)"]
+
+    # it follows the plot, and stays rotated
+    cv.w_y.value = "CD8 (APC-A)"
+    assert list(cv.ylabel.text.string.array) == ["CD8 (APC-A)"]
+    cv.w_plot.value = "histogram"
+    assert list(cv.ylabel.text.string.array) == ["% of mode"]
+    assert cv.ylabel.text.rotation == Y_LABEL_ROTATION
+
+
+# --------------------------------------------------------------------------
+# the widgets are a view of the plot, not the state itself
+# --------------------------------------------------------------------------
+def test_swap_actually_swaps_the_plot(cv):
+    """Setting a widget with its callback suppressed used to move the view only."""
+    before = np.asarray(cv.density.data).copy()
+    cv.w_swap.clicked()
+
+    assert (cv.panel.x, cv.panel.y) == ("CD19 (PE-A)", "CD3 (FITC-A)")
+    assert (cv.w_x.value, cv.w_y.value) == (cv.panel.x, cv.panel.y)
+    assert not np.array_equal(np.asarray(cv.density.data), before)  # the plot redrew
+
+    labels = _labels(cv)
+    assert "CD19 (PE-A)" in labels and "CD3 (FITC-A)" in labels
+    assert list(cv.ylabel.text.string.array) == ["CD3 (FITC-A)"]
+    cv.w_swap.clicked()
+    assert (cv.panel.x, cv.panel.y) == ("CD3 (FITC-A)", "CD19 (PE-A)")
+
+
+def test_set_plot_moves_state_and_widgets_together(cv):
+    cv.set_plot(x="CD8 (APC-A)", kind="histogram")
+    assert (cv.panel.x, cv.panel.kind) == ("CD8 (APC-A)", "histogram")
+    assert (cv.w_x.value, cv.w_plot.value) == ("CD8 (APC-A)", "histogram")
+    assert cv.curves.visible is True
+
+    with pytest.raises(AttributeError, match="not a plot setting"):
+        cv.set_plot(bins=64)
+
+
+def test_a_gate_after_a_swap_uses_the_new_axes(cv):
+    """The bug would have gated against the channels the plot no longer showed."""
+    cv.w_swap.clicked()
+    cv.gates.add_polygons([_rect(cv, 0.0, 4.0, 3.0, 9.0)])
+    cv.apply_gate("swapped")
+
+    # x is now CD19 and y is CD3
+    expected = _truth(cv.adata, "asinh", "CD19", "CD3", (0.0, 4.0, 3.0, 9.0))
+    assert int(cv.adata.obs["swapped"].sum()) == int(expected.sum())
+    assert cv.adata.uns["cytopy"]["gates"]["swapped"]["x"] == "CD19 (PE-A)"
+
+
+# --------------------------------------------------------------------------
+# choosing which samples a histogram draws
+# --------------------------------------------------------------------------
+@pytest.fixture
+def three(demo, demo_path, make_napari_viewer):
+    """Three samples of decreasing brightness, in one viewer."""
+    import cytopy
+    from cytopy.viewer import CytoViewer
+
+    cytopy.asinh_transform(demo, 150.0)
+    parts = [demo]
+    for name, factor in (("b", 0.6), ("c", 0.3)):
+        other = cytopy.read_fcs(demo_path, sample_id=name)
+        other.X = other.X * np.float32(factor)
+        cytopy.asinh_transform(other, 150.0)
+        parts.append(other)
+    cv = CytoViewer(parts, layer="asinh", x="CD3", y="CD19", bins=128, viewer=make_napari_viewer())
+    cv.set_plot(kind="histogram")
+    return cv
+
+
+def test_picking_no_samples_draws_them_all(three):
+    """So the plot is never accidentally empty."""
+    assert list(three.w_samples.choices) == ["demo", "b", "c"]
+    assert three.panel.samples == ()
+    assert [name for name, _ in three.histogram_groups()] == ["demo", "b", "c"]
+
+
+def test_samples_can_be_picked(three):
+    three.w_samples.value = ["demo", "c"]
+    assert three.panel.samples == ("demo", "c")
+    assert [name for name, _ in three.histogram_groups()] == ["demo", "c"]
+    assert [t for _, _, t in three.panel.legend] == ["demo (60,000)", "c (60,000)"]
+    assert three.panel.title.startswith("demo, c")
+
+    three.set_plot(samples=["b"])
+    assert [name for name, _ in three.histogram_groups()] == ["b"]
+    assert three.w_samples.value == ["b"]
+
+
+def test_one_list_serves_both_plots(three):
+    """Selecting one sample is how you show one; there is no separate field."""
+    assert not hasattr(three, "w_sample")
+    assert three.w_samples.enabled is True
+
+    three.set_plot(kind="density", samples=["b"])
+    assert int(three.selection_mask().sum()) == 60_000
+    assert three.panel.title.startswith("b —")
+
+    # a density pools whatever is picked ...
+    three.set_plot(samples=["b", "c"])
+    assert int(three.selection_mask().sum()) == 120_000
+    # ... and a histogram draws one curve for each
+    three.set_plot(kind="histogram")
+    assert [name for name, _ in three.histogram_groups()] == ["b", "c"]
+    assert three.w_samples.enabled is True
+
+
+def test_a_parent_gate_still_narrows_the_curves(three):
+    three.set_plot(kind="density")
+    three.gates.add_polygons([_rect(three, 3.0, 9.0, -2.0, 9.0)])
+    three.apply_gate("bright")
+    three.set_plot(kind="histogram", parent="bright")
+
+    for _, mask in three.histogram_groups():
+        assert not (mask & ~three.adata.obs["bright"].to_numpy()).any()
+
+
+# --------------------------------------------------------------------------
+# the area under each curve
+# --------------------------------------------------------------------------
+def test_each_curve_is_filled_under_its_line(three):
+    from cytopy.viewer import CURVE_FILL_ALPHA
+
+    three.w_samples.value = ["demo", "b"]
+    kinds = [str(k) for k in three.curves.shape_type]
+    # two fills, two lines, two legend rules
+    assert kinds == ["polygon", "polygon", "path", "path", "path", "path"]
+
+    faces = np.asarray(three.curves.face_color)
+    expected = int(CURVE_FILL_ALPHA, 16) / 255
+    assert faces[0][3] == pytest.approx(expected, abs=0.01)
+    assert 0 < faces[0][3] < 0.5  # translucent, so overlaps stay readable
+    assert faces[2][3] == 0.0  # the lines themselves are not filled
+
+    # a fill is its curve closed down to the baseline
+    fill = np.asarray(three.curves.data[0])
+    line = np.asarray(three.curves.data[2])
+    assert len(fill) == len(line) + 2
+    assert np.allclose(fill[: len(line)], line)
+    assert fill[-1][0] == fill[-2][0] == pytest.approx(three.bins)  # just below the floor
+
+
+def test_fill_and_line_share_a_colour(three):
+    three.w_samples.value = ["demo", "b"]
+    faces = np.asarray(three.curves.face_color)
+    edges = np.asarray(three.curves.edge_color)
+    for i in range(2):
+        assert np.allclose(faces[i][:3], edges[i + 2][:3])
+    assert not np.allclose(edges[2][:3], edges[3][:3])  # ... but differ between samples

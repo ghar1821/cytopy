@@ -21,7 +21,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-__all__ = ["report"]
+__all__ = ["gating_pdf", "report"]
 
 #: Sections drawn when none are named, in order. Each is skipped when the data
 #: carries nothing for it.
@@ -377,3 +377,210 @@ def _debarcode_section(adata: ad.AnnData, dpi: int, max_barcodes: int) -> str:
     except (KeyError, ValueError):
         pass
     return out
+
+
+def gating_pdf(
+    adata: ad.AnnData,
+    path: str | os.PathLike,
+    *,
+    title: str | None = None,
+    ncols: int = 3,
+    per_page: int = 6,
+    subsample: int | None = 200_000,
+    dpi: int = 150,
+    **kwargs,
+) -> Path:
+    """Write the gating hierarchy to a PDF, one plot per gate.
+
+    Each gate gets the biaxial it was actually drawn on, showing the events its
+    parent let through, with its own outline over them and the events it kept
+    picked out. Gates come out parents first, so the pages read the way the
+    gating was done.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying gates in ``uns['cytopy']['gates']``.
+    path
+        PDF file to write.
+    title
+        Heading for the first page. Defaults to the sample name, or the file's.
+    ncols
+        Plots across a page.
+    per_page
+        Plots on a page. Rounded up to fill whole rows.
+    subsample
+        Events to draw each plot from. ``None`` draws all of them; the default
+        keeps a hierarchy on a run of millions quick without visibly changing
+        a density.
+    dpi
+        Resolution of the figures.
+    **kwargs
+        Passed to :func:`~cytopy.plot_biaxial`.
+
+    Returns
+    -------
+    Path
+        The file written.
+
+    Raises
+    ------
+    ValueError
+        If nothing has been gated, or no gate recorded the plane it was drawn
+        in -- there would be nothing to draw.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg", force=False)
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    from .plotting import plot_biaxial
+
+    gates = adata.uns.get("cytopy", {}).get("gates", {})
+    order = _hierarchy(gates)
+    drawable = [g for g in order if gates[g].get("vertices") and g in adata.obs]
+    if not drawable:
+        raise ValueError(
+            "no gates with an outline to draw; gates applied from a mask rather "
+            "than drawn record no plane"
+        )
+
+    plotted = _thin(adata, subsample)
+    if title is None:
+        title = _default_title(adata)
+    rows = int(np.ceil(per_page / ncols))
+    page_size = rows * ncols
+
+    path = Path(path)
+    with PdfPages(path) as pdf:
+        pdf.savefig(_hierarchy_page(adata, gates, order, title), dpi=dpi)
+        plt.close("all")
+        for start in range(0, len(drawable), page_size):
+            chunk = drawable[start : start + page_size]
+            fig, axes = plt.subplots(rows, ncols, figsize=(3.6 * ncols, 3.5 * rows), squeeze=False)
+            flat = axes.ravel()
+            for ax, name in zip(flat, chunk):
+                _draw_gate_page(plotted, adata, gates, name, ax, plot_biaxial, kwargs)
+            for ax in flat[len(chunk) :]:
+                ax.set_visible(False)
+            fig.tight_layout()
+            pdf.savefig(fig, dpi=dpi)
+            plt.close(fig)
+    return path
+
+
+def _hierarchy(gates: dict) -> list[str]:
+    """Gate names, parents before their children."""
+    order: list[str] = []
+
+    def _walk(under: str) -> None:
+        """Depth first, appending every gate nested under ``under``."""
+        for name, record in gates.items():
+            if str(record.get("parent") or "") == under:
+                order.append(name)
+                _walk(name)
+
+    _walk("")
+    # Anything whose parent is missing still deserves a page.
+    order += [g for g in gates if g not in order]
+    return order
+
+
+def _depth(gates: dict, name: str) -> int:
+    depth = 0
+    seen = set()
+    while name and name in gates and name not in seen:
+        seen.add(name)
+        name = str(gates[name].get("parent") or "")
+        depth += 1 if name else 0
+    return depth
+
+
+def _default_title(adata: ad.AnnData) -> str:
+    if "sample" in adata.obs and adata.n_obs:
+        names = adata.obs["sample"].astype(str).unique()
+        if len(names) == 1:
+            return str(names[0])
+    return "gating"
+
+
+def _draw_gate_page(plotted, adata, gates, name, ax, plot_biaxial, kwargs) -> None:
+    """One gate: its parent's events, its outline, and what it kept."""
+    record = gates[name]
+    parent = str(record.get("parent") or "")
+    stored = str(record.get("layer", "X"))
+    layer = None if stored in ("X", "") else stored
+
+    n = int(adata.obs[name].sum())
+    total = int(adata.obs[parent].sum()) if parent and parent in adata.obs else adata.n_obs
+    share = 100 * n / max(total, 1)
+    lineage = f"{parent} > " if parent else ""
+
+    try:
+        plot_biaxial(
+            plotted,
+            record["x"],
+            record["y"],
+            layer=layer,
+            subset=parent or None,
+            color_by=name if name in plotted.obs else "density",
+            gate=name,
+            title=f"{lineage}{name}\n{n:,} of {total:,}  ({share:.1f}%)",
+            ax=ax,
+            **kwargs,
+        )
+    except (KeyError, ValueError) as exc:  # pragma: no cover - defensive
+        ax.set_axis_off()
+        ax.text(0.5, 0.5, f"{name}\n{exc}", ha="center", va="center", fontsize=7)
+
+
+def _hierarchy_page(adata, gates, order, title):
+    """A contents page: the tree, with counts and frequencies."""
+    import matplotlib.pyplot as plt
+
+    rows = []
+    for name in order:
+        record = gates[name]
+        parent = str(record.get("parent") or "")
+        n = int(adata.obs[name].sum()) if name in adata.obs else 0
+        total = int(adata.obs[parent].sum()) if parent and parent in adata.obs else adata.n_obs
+        rows.append(
+            (
+                "    " * _depth(gates, name) + name,
+                f"{n:,}",
+                f"{100 * n / max(total, 1):.2f}%",
+                f"{100 * n / max(adata.n_obs, 1):.2f}%",
+            )
+        )
+
+    height = 1.6 + 0.24 * len(rows)
+    fig, ax = plt.subplots(figsize=(8.3, min(height, 11.0)))
+    ax.set_axis_off()
+    ax.text(0, 1.0, title, fontsize=15, va="top", weight="bold", transform=ax.transAxes)
+    ax.text(
+        0,
+        0.955,
+        f"{adata.n_obs:,} events   {len(rows)} gates",
+        fontsize=9,
+        va="top",
+        color="#666",
+        transform=ax.transAxes,
+    )
+    table = ax.table(
+        cellText=rows,
+        colLabels=["gate", "events", "% of parent", "% of total"],
+        colWidths=[0.5, 0.17, 0.17, 0.16],
+        cellLoc="right",
+        loc="upper left",
+        bbox=[0, 0, 1, 0.90],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_linewidth(0.3)
+        if col == 0:
+            cell.set_text_props(ha="left")
+        if row == 0:
+            cell.set_text_props(weight="bold")
+    return fig

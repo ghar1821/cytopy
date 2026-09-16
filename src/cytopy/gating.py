@@ -8,7 +8,15 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
-__all__ = ["add_gate", "gate_stats", "polygon_mask", "rectangle_to_polygon"]
+__all__ = [
+    "add_gate",
+    "gate_children",
+    "gate_mask",
+    "gate_stats",
+    "polygon_mask",
+    "recompute_gates",
+    "rectangle_to_polygon",
+]
 
 
 def rectangle_to_polygon(verts: np.ndarray) -> np.ndarray:
@@ -200,3 +208,111 @@ def gate_stats(adata: ad.AnnData, name: str, parent: str | None = None) -> dict:
         n_parent = int(adata.obs[parent].to_numpy(dtype=bool).sum())
         out["pct_parent"] = 100.0 * n / max(n_parent, 1)
     return out
+
+
+def gate_mask(adata: ad.AnnData, name: str) -> np.ndarray:
+    """Recompute a recorded gate from the outline it was drawn with.
+
+    The outline is kept in data coordinates, so this does not need the canvas
+    it was drawn on. The canvas maps data to pixels with an affine transform,
+    which leaves the inside of a shape unchanged, so this reproduces exactly
+    what the viewer computed at the time.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying the gate in ``uns['cytopy']['gates']``.
+    name
+        The gate to recompute.
+
+    Returns
+    -------
+    ndarray
+        Boolean mask over all events, already intersected with the gate's
+        parent.
+
+    Raises
+    ------
+    KeyError
+        If the gate was never recorded, or recorded no outline -- one applied
+        from a mask rather than drawn cannot be recomputed.
+    """
+    gates = adata.uns.get("cytopy", {}).get("gates", {})
+    if name not in gates:
+        raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
+    record = gates[name]
+    vertices = record.get("vertices")
+    if not vertices or "x" not in record or "y" not in record:
+        raise KeyError(f"gate {name!r} has no outline to recompute from")
+
+    from .transforms import channel_index
+
+    layer = str(record.get("layer", "X"))
+    matrix = adata.X if layer in ("X", "") else adata.layers[layer]
+    xi = channel_index(adata, record["x"])
+    yi = channel_index(adata, record["y"])
+    points = np.column_stack(
+        [
+            np.asarray(matrix[:, xi], dtype=np.float64).ravel(),
+            np.asarray(matrix[:, yi], dtype=np.float64).ravel(),
+        ]
+    )
+    kinds = record.get("shape_types") or ["polygon"] * len(vertices)
+    mask = shapes_mask(points, [np.asarray(v, dtype=float) for v in vertices], list(kinds))
+
+    parent = record.get("parent") or ""
+    if parent and parent in adata.obs:
+        mask = mask & adata.obs[parent].to_numpy(dtype=bool)
+    return mask
+
+
+def gate_children(adata: ad.AnnData, name: str) -> list[str]:
+    """Gates nested directly inside ``name``.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying the gates.
+    name
+        The parent gate.
+
+    Returns
+    -------
+    list of str
+        Child gate names, in the order they were recorded.
+    """
+    gates = adata.uns.get("cytopy", {}).get("gates", {})
+    return [g for g, record in gates.items() if str(record.get("parent") or "") == name]
+
+
+def recompute_gates(adata: ad.AnnData, name: str) -> list[str]:
+    """Bring a gate's descendants back in line after it has been changed.
+
+    A child is stored as the events inside its own outline *and* inside its
+    parent, worked out when it was drawn. Move the parent and the child is
+    stale until it is recomputed, which is what this does, depth first.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying the gates. Modified in place.
+    name
+        The gate that changed. It is not itself recomputed.
+
+    Returns
+    -------
+    list of str
+        The descendants that were updated, parents before children. A child
+        with no stored outline is skipped and left as it was.
+    """
+    updated: list[str] = []
+    for child in gate_children(adata, name):
+        try:
+            mask = gate_mask(adata, child)
+        except KeyError:
+            continue
+        adata.obs[child] = pd.Series(mask, index=adata.obs_names)
+        adata.uns["cytopy"]["gates"][child]["n"] = int(mask.sum())
+        updated.append(child)
+        updated += recompute_gates(adata, child)
+    return updated

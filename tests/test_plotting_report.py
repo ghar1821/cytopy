@@ -299,3 +299,112 @@ def test_the_log_keeps_appending_after_a_round_trip(barcoded, tmp_path):
     log = cytopy.filter_log(second)
     assert list(log["step"]) == ["remove beads", "later"]
     assert list(log["n_after"]) == [first.n_obs, 1000]
+
+
+# --------------------------------------------------------------------------
+# the gating hierarchy as a PDF
+# --------------------------------------------------------------------------
+def _hierarchy(adata):
+    """Three nested gates, the last drawn on a different pair of channels."""
+    import cytopy
+
+    cytopy.asinh_transform(adata, 150.0)
+    values = np.asarray(adata.layers["asinh"])
+
+    def gate(name, x, y, box, parent=None):
+        xi, yi = cytopy.channel_index(adata, x), cytopy.channel_index(adata, y)
+        mask = (
+            (values[:, xi] > box[0])
+            & (values[:, xi] < box[1])
+            & (values[:, yi] > box[2])
+            & (values[:, yi] < box[3])
+        )
+        cytopy.add_gate(
+            adata,
+            name,
+            mask,
+            parent=parent,
+            meta={
+                "x": str(adata.var_names[xi]),
+                "y": str(adata.var_names[yi]),
+                "layer": "asinh",
+                "vertices": [
+                    [[box[0], box[2]], [box[0], box[3]], [box[1], box[3]], [box[1], box[2]]]
+                ],
+                "shape_types": ["polygon"],
+            },
+        )
+
+    gate("lymphocytes", "CD3", "CD19", (2.0, 9.0, -2.0, 9.0))
+    gate("T cells", "CD3", "CD19", (3.0, 9.0, -2.0, 4.0), parent="lymphocytes")
+    gate("CD8+", "CD8", "CD3", (3.0, 9.0, 3.0, 9.0), parent="T cells")
+    return adata
+
+
+def test_gating_pdf_writes_a_page_per_gate(demo, tmp_path):
+    _hierarchy(demo)
+    path = cytopy.gating_pdf(demo, tmp_path / "gating.pdf", ncols=3, per_page=3)
+    assert path.exists() and path.stat().st_size > 10_000
+    assert path.read_bytes().startswith(b"%PDF")
+    # a contents page plus one page of three plots
+    from matplotlib.backends.backend_pdf import PdfPages  # noqa: F401
+
+    assert path.read_bytes().count(b"/Page") >= 2
+
+
+def test_the_hierarchy_comes_out_parents_first(demo):
+    from cytopy.report import _hierarchy as order_of
+
+    _hierarchy(demo)
+    gates = demo.uns["cytopy"]["gates"]
+    assert order_of(gates) == ["lymphocytes", "T cells", "CD8+"]
+
+
+def test_each_gate_is_drawn_on_the_plane_it_was_drawn_in(demo):
+    import matplotlib.pyplot as plt
+
+    from cytopy.plotting import plot_biaxial
+    from cytopy.report import _draw_gate_page
+
+    _hierarchy(demo)
+    gates = demo.uns["cytopy"]["gates"]
+    _, axes = plt.subplots(1, 3)
+    for ax, name in zip(axes, ["lymphocytes", "T cells", "CD8+"]):
+        _draw_gate_page(demo, demo, gates, name, ax, plot_biaxial, {})
+
+    # the last gate was drawn on a different pair, and follows it
+    assert axes[0].get_xlabel() == "CD3 (FITC-A)"
+    assert axes[2].get_xlabel() == "CD8 (APC-A)"
+    assert axes[2].get_ylabel() == "CD3 (FITC-A)"
+    # each title carries its lineage and its share of its own parent
+    n = int(demo.obs["T cells"].sum())
+    total = int(demo.obs["lymphocytes"].sum())
+    title = axes[1].get_title(loc="left")
+    assert "lymphocytes > T cells" in title
+    assert f"{n:,} of {total:,}" in title and f"{100 * n / total:.1f}%" in title
+
+
+def test_the_contents_page_lists_the_tree(demo):
+    from cytopy.report import _hierarchy as order_of
+    from cytopy.report import _hierarchy_page
+
+    _hierarchy(demo)
+    gates = demo.uns["cytopy"]["gates"]
+    fig = _hierarchy_page(demo, gates, order_of(gates), "run 1")
+    text = [t.get_text() for t in fig.axes[0].texts]
+    assert "run 1" in text
+    assert any("60,000 events" in t for t in text)
+
+    cells = [c.get_text().get_text() for c in fig.axes[0].tables[0].get_celld().values()]
+    assert any(c.strip() == "lymphocytes" for c in cells)
+    assert any(c.startswith("    ") and c.strip() == "T cells" for c in cells)  # indented
+    assert f"{int(demo.obs['CD8+'].sum()):,}" in cells
+
+
+def test_gating_pdf_needs_something_to_draw(demo, tmp_path):
+    with pytest.raises(ValueError, match="no gates with an outline"):
+        cytopy.gating_pdf(demo, tmp_path / "empty.pdf")
+
+    cytopy.add_gate(demo, "from a mask", np.ones(demo.n_obs, dtype=bool))
+    with pytest.raises(ValueError, match="no gates with an outline"):
+        cytopy.gating_pdf(demo, tmp_path / "empty.pdf")

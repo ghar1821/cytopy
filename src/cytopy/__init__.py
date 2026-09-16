@@ -29,10 +29,17 @@ from .debarcode import (
 )
 from .density import Axes2D, density_image
 from .filters import filter_events, filter_log, record_filter
-from .gating import add_gate, gate_stats, polygon_mask
+from .gating import (
+    add_gate,
+    gate_children,
+    gate_mask,
+    gate_stats,
+    polygon_mask,
+    recompute_gates,
+)
 from .io import concat_samples, read_fcs, read_fcs_dir
 from .plotting import plot_biaxial, plot_gate
-from .report import report
+from .report import gating_pdf, report
 from .scales import AsinhScale, LinearScale, LogicleScale, LogScale, get_scale
 from .spillover import (
     read_controls,
@@ -86,7 +93,10 @@ __all__ = [
     "filter_log",
     "fluor_channels",
     "gate_beads",
+    "gate_children",
+    "gate_mask",
     "gate_stats",
+    "gating_pdf",
     "get_scale",
     "logicle_transform",
     "mass_channels",
@@ -102,6 +112,7 @@ __all__ = [
     "read_fcs",
     "read_fcs_dir",
     "read_spillover",
+    "recompute_gates",
     "record_filter",
     "remove_beads",
     "report",

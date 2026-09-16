@@ -321,57 +321,60 @@ it kept.
 
 * Pick the two channels and the matrix to plot (`X` or any layer).
 * The plot is a smoothed 2-D histogram; `log counts` is on by default so rare
-  populations stay visible. `robust limits` clips the axes to the
-  0.1–99.9th percentile so a few extreme events cannot flatten the plot.
+  populations stay visible.
 * Select the **gates** layer, draw a polygon (or rectangle/ellipse), name it and
   hit *apply gate from shapes*. The gate lands in `adata.obs[name]` as a
-  boolean column, and the canvas clears — so the next gate is only what you
-  draw for it. Draw several shapes before applying to make one gate out of
-  their union.
+  boolean column and **stays on screen**, outlined on an *applied gates* layer
+  and labelled with its name and its share of its own parent. The editable
+  layer clears, so the next gate is only what you draw for it — draw several
+  shapes before applying to make one gate out of their union.
+* To change a gate later, pick it under **edit gate** and hit *load gate onto
+  canvas*: the plot switches to the plane it was drawn in, the outline comes
+  back editable, and applying it again replaces it. **Its children are
+  recomputed**, so a hierarchy stays consistent when you move a parent. *delete
+  gate* removes it and everything nested inside it.
+* Outside the viewer, `cytopy.gate_mask(adata, name)` recomputes a gate from
+  the outline it was drawn with, and `cytopy.recompute_gates(adata, name)`
+  brings its descendants back in line.
+* The **gates** layer is always kept on top — a gate you cannot see is a gate
+  you cannot adjust.
 * Shapes are kept in data coordinates, so changing channel, sample, parent gate
   or bin count moves the axes without moving what a shape covers.
-* Robust limits clip the axes to the 0.1–99.9th percentile, so a few events are
-  drawn nowhere and cannot be gated. Applying a gate says how many, and
-  `cv.off_axis_count()` reports it at any time; turn **robust limits** off to
-  include them.
+* Clipping the axes means a few events are drawn nowhere and cannot be gated.
+  Applying a gate says how many, and `cv.off_axis_count()` reports it at any
+  time.
 * Set **parent gate** to an existing gate to plot only those events; gates
   applied then intersect with the parent, so hierarchies compose.
-* Each plot is a **panel**, and each panel is its own napari layer — so it
-  shows up in the layer list, can be hidden there, and can be dragged about.
-  *+ density* and *+ histogram* add one (starting from whatever you were
-  looking at), *remove panel* takes one away, *arrange* tiles them. **Click a
-  panel and the settings rebind to it**: plot kind, data layer, x, y, sample
-  and parent gate belong to the panel; bins, smoothing, colormap, background
-  and the rest apply to all of them, so panels stay comparable.
-* Turn on **move panels** and dragging moves a panel — frame, labels and all —
-  instead of panning. Drop one on top of another and they overlay, with the
-  denser one winning each pixel so neither buries the other.
-* A panel's **plot** is either the two-channel **density** or a 1-D
-  **histogram**: one smoothed distribution of the x channel per sample, in its
-  own colour, with a legend. On a histogram a drawn shape gates the interval it
-  spans, which is how a threshold is set. Curves are unit-area densities so
-  samples of different sizes compare; *scale each curve to its peak* switches to
-  comparing shape alone.
-* Gates are drawn against the **active** panel, and all panels share one
-  intensity scale, so equal brightness means equal density.
-* Duplicating a panel's layer in napari does *not* give a second plot: that
-  layer is rewritten on every redraw, and a copy is a frozen snapshot in a
-  coordinate frame that has since moved. Add a panel instead.
-* A **colour bar** sits to the right, labelled `0%`–`100%` **of peak density**.
-  Events per bin is the obvious label and the wrong one: a bin is a cell of the
-  display grid, not a unit of the data, so the same events in the same channels
-  peak at ~470 per bin at 64 bins and ~5 at 1024 — the number lurches about for
-  reasons that have nothing to do with the sample. A share of the peak holds
-  still, and stays comparable between two panels because they share one scale.
-  The absolute peak is in the status line, where it does not move around. Turn
-  the bar off in the display section.
-* The canvas is **white** by default, with empty bins transparent so the
-  background shows through them. Change it with **background** in the display
-  section, or `cytopy.view(adata, background="black")` — the axis text, ticks
-  and gate outlines flip between light and dark to stay legible.
-* The **beads** panel appears for mass cytometry panels only. It plots one bead
-  channel against DNA at a time, outlines the current gate, and shows the bead
-  count live as you move it.
+* One plot. **plot** switches it between the two-channel **density** and a 1-D
+  **histogram** — one smoothed distribution of the x channel per sample, each
+  in its own colour with a translucent fill under it, and a legend. The y axis
+  is **% of mode** — each curve scaled so its tallest point is 100, as flow
+  software does — so a rare population reads against a common one. On a
+  histogram a drawn shape gates the interval it spans, which is how a threshold
+  is set.
+* **samples** picks which samples the plot shows, in either mode. Choosing none
+  draws them all; a density pools whatever is picked, a histogram draws a curve
+  for each.
+* The heading above the plot is `<sample> — <parent gate>`, so it always says
+  what you are looking at and what it came from.
+* The axes always clip to the 0.1–99.9th percentile. Without it a single
+  extreme event — and compensation makes those — stretches the axis until
+  everything else is a dot in the corner. Pass `robust=False` to `view` if you
+  really want the full range.
+* Duplicating the plot's layer in napari does not give a second plot: that
+  layer is rewritten on every redraw.
+
+### Exporting a gating hierarchy
+
+```python
+cytopy.gating_pdf(adata, "gating.pdf")
+```
+
+A contents page with the tree — every gate, its count, its share of its parent
+and of the file — then one plot per gate: the biaxial it was actually drawn on,
+its parent's events underneath, its own outline over them and the events it
+kept picked out. Gates come out parents first, so the pages read the way the
+gating was done.
 
 Gate provenance (channels, layer, parent, counts) is kept in
 `adata.uns["cytopy"]["gates"]`.
