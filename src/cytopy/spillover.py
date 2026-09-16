@@ -1,0 +1,564 @@
+"""Spillover matrices: derive one from single-stain controls, or read one in.
+
+There are three ways to get a matrix, in increasing order of effort:
+
+* the acquisition software already computed one and wrote it into the FCS
+  file, where :func:`~cytopy.read_fcs` picks it up as ``adata.uns['spillover']``;
+* some other program exported one, and :func:`read_spillover` reads its CSV;
+* you have the single-stain controls, and :func:`spillover_from_controls`
+  computes one from them by the Bagwell and Adams method.
+
+All three produce the same thing: a square DataFrame indexed by detector, with
+``1`` on the diagonal, where ``S[i, j]`` is the fraction of dye *i*'s signal
+that lands in detector *j*. :func:`~cytopy.compensate` takes it from there.
+"""
+
+from __future__ import annotations
+
+import io as _io
+import os
+import re
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+import anndata as ad
+import numpy as np
+import pandas as pd
+
+from .transforms import channel_index, fluor_channels
+
+__all__ = [
+    "read_controls",
+    "read_spillover",
+    "spillover_from_controls",
+    "write_spillover",
+]
+
+# File names a universal negative tends to be given.
+_UNSTAINED_RE = re.compile(r"unstain|unlabel|autofluor|^blank|^neg\b|universal", re.IGNORECASE)
+
+
+def _clean_name(name: object) -> str:
+    """Strip the decoration other software puts on detector names.
+
+    Handles FlowJo's ``Comp-FITC-A`` prefix and its ``FITC-A :: CD3``
+    detector/marker pairs, plus stray quoting and whitespace.
+    """
+    text = str(name).strip().strip('"').strip("'").strip()
+    text = re.split(r"\s*::\s*", text)[0]
+    text = re.sub(r"^comp[-_ ]", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _norm(name: object) -> str:
+    """Squash a name to letters and digits, for fuzzy file-name matching."""
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _parse_spillover_keyword(raw: str) -> pd.DataFrame | None:
+    """Parse an FCS ``$SPILLOVER`` payload, or return None if it is malformed.
+
+    The keyword is a flat comma-separated list: the detector count, then that
+    many detector names, then the matrix row by row.
+
+    Parameters
+    ----------
+    raw
+        The keyword value, as stored in the TEXT segment.
+
+    Returns
+    -------
+    DataFrame or None
+        Square matrix indexed and columned by detector name.
+    """
+    parts = [p.strip().strip('"') for p in str(raw).split(",")]
+    try:
+        n = int(parts[0])
+    except (ValueError, IndexError):
+        return None
+    if n <= 0 or len(parts) < 1 + n + n * n:
+        return None
+    names = [_clean_name(p) for p in parts[1 : 1 + n]]
+    try:
+        values = np.asarray(parts[1 + n : 1 + n + n * n], dtype=float).reshape(n, n)
+    except ValueError:
+        return None
+    return pd.DataFrame(values, index=names, columns=names)
+
+
+# --------------------------------------------------------------------------
+# reading and writing
+# --------------------------------------------------------------------------
+def read_spillover(
+    path: str | os.PathLike,
+    *,
+    delimiter: str | None = None,
+    percent: bool | None = None,
+    inverted: bool = False,
+) -> pd.DataFrame:
+    """Read a spillover matrix exported by some other software.
+
+    Copes with what the common exporters actually write: with or without a
+    row-name column, comma / tab / semicolon separated, values as fractions or
+    as percentages, detector names decorated as ``Comp-FITC-A`` or
+    ``FITC-A :: CD3``. A file holding a bare ``$SPILLOVER`` keyword payload on
+    one line is also accepted.
+
+    Parameters
+    ----------
+    path
+        CSV/TSV file to read.
+    delimiter
+        Field separator. Sniffed from the first line when ``None``.
+    percent
+        Whether the values are percentages that need dividing by 100. Decided
+        from the diagonal when ``None``, which is right unless the matrix is
+        wildly off-diagonal.
+    inverted
+        Set when the file holds a *compensation* matrix (the inverse of the
+        spillover matrix, which is what a few tools export). It is inverted on
+        the way in so that what comes back is always a spillover matrix.
+
+    Returns
+    -------
+    DataFrame
+        Square, indexed and columned by detector name, ready to hand to
+        :func:`~cytopy.compensate`.
+
+    Raises
+    ------
+    ValueError
+        If the file is empty, is not square, holds non-numeric values, or has
+        a zero on the diagonal.
+    """
+    path = Path(path)
+    text = path.read_text()
+    lines = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if not lines:
+        raise ValueError(f"{path} is empty")
+
+    if len(lines) == 1:
+        frame = _parse_spillover_keyword(lines[0])
+        if frame is None:
+            raise ValueError(f"{path} has a single line that is not a $SPILLOVER payload")
+    else:
+        if delimiter is None:
+            delimiter = max([",", "\t", ";"], key=lines[0].count)
+        frame = pd.read_csv(_io.StringIO(text), sep=delimiter, engine="python", comment="#")
+        # A leading column of row names is optional. One column more than there
+        # are rows can only be row names; otherwise go by dtype.
+        first = frame.columns[0]
+        if frame.shape[1] == frame.shape[0] + 1 or not pd.api.types.is_numeric_dtype(frame[first]):
+            frame = frame.set_index(first)
+        frame.columns = [_clean_name(c) for c in frame.columns]
+        if isinstance(frame.index, pd.RangeIndex):
+            frame.index = pd.Index(frame.columns)
+        else:
+            frame.index = pd.Index([_clean_name(i) for i in frame.index])
+
+    if frame.shape[0] != frame.shape[1]:
+        raise ValueError(f"{path} is {frame.shape[0]}x{frame.shape[1]}, not square")
+    try:
+        values = frame.to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} holds non-numeric values: {exc}") from exc
+
+    diagonal = np.diag(values)
+    if percent is None:
+        percent = bool(np.median(diagonal) > 50)
+    if percent:
+        values = values / 100.0
+        diagonal = np.diag(values)
+    if np.any(diagonal == 0):
+        zero = [str(n) for n, d in zip(frame.index, diagonal) if d == 0]
+        raise ValueError(f"{path} has a zero on the diagonal for {zero}")
+    if inverted:
+        values = np.linalg.inv(values)
+
+    return pd.DataFrame(values, index=frame.index, columns=frame.columns)
+
+
+def write_spillover(spillover: pd.DataFrame, path: str | os.PathLike) -> Path:
+    """Write a spillover matrix as CSV, with detector names down the first column.
+
+    Parameters
+    ----------
+    spillover
+        Square matrix, as returned by :func:`spillover_from_controls` or
+        :func:`read_spillover`.
+    path
+        File to write.
+
+    Returns
+    -------
+    Path
+        The path written, so it can be chained.
+    """
+    path = Path(path)
+    spillover.to_csv(path, index_label="detector")
+    return path
+
+
+# --------------------------------------------------------------------------
+# single-stain controls
+# --------------------------------------------------------------------------
+def _otsu_threshold(values: np.ndarray, cofactor: float, nbins: int = 512) -> float:
+    """Otsu's two-class threshold, found on an arcsinh scale and returned in raw units.
+
+    Fluorescence is split on a compressed scale for the same reason it is
+    plotted on one: on a linear axis the whole negative population sits in a
+    single bin, and the threshold that maximises between-class variance lands
+    somewhere in the middle of the positives.
+    """
+    scaled = np.arcsinh(np.asarray(values, dtype=np.float64) / cofactor)
+    scaled = scaled[np.isfinite(scaled)]
+    if scaled.size < 2:
+        return float("inf")
+    lo, hi = np.percentile(scaled, [0.1, 99.9])
+    if not hi > lo:
+        return float("inf")
+    counts, edges = np.histogram(scaled, bins=nbins, range=(float(lo), float(hi)))
+    total = counts.sum()
+    if total == 0:
+        return float("inf")
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    weight = np.cumsum(counts) / total
+    mean = np.cumsum(counts * centres) / total
+    spread = weight * (1.0 - weight)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        between = np.where(spread > 0, (mean[-1] * weight - mean) ** 2 / spread, 0.0)
+    return float(np.sinh(centres[int(np.argmax(between))]) * cofactor)
+
+
+def _positive_mask(column: np.ndarray, cofactor: float) -> tuple[np.ndarray, float]:
+    """Boolean mask of the stained events in one channel, plus the threshold used."""
+    threshold = _otsu_threshold(column, cofactor)
+    return column > threshold, threshold
+
+
+def _separation(column: np.ndarray, positive: np.ndarray, min_events: int = 1) -> float:
+    """How far apart a split puts the two populations, in negative-MAD units.
+
+    A genuinely stained control lands in the tens; splitting noise in half
+    gives about 2, which is how a mislabelled tube is told apart from a real
+    one.
+    """
+    if positive.sum() < min_events or (~positive).sum() < min_events:
+        return -np.inf
+    negative = column[~positive]
+    centre = np.median(negative)
+    mad = 1.4826 * np.median(np.abs(negative - centre))
+    return float((np.median(column[positive]) - centre) / max(mad, 1e-9))
+
+
+def _as_anndata(source: ad.AnnData | str | os.PathLike) -> ad.AnnData:
+    if isinstance(source, ad.AnnData):
+        return source
+    from .io import read_fcs  # local: io imports this module for keyword parsing
+
+    return read_fcs(source)
+
+
+def _stat(values: np.ndarray, statistic: str) -> np.ndarray:
+    if statistic == "median":
+        return np.median(values, axis=0)
+    if statistic == "mean":
+        return np.mean(values, axis=0)
+    raise ValueError(f"statistic must be 'median' or 'mean', not {statistic!r}")
+
+
+def spillover_from_controls(
+    controls: Mapping[str, ad.AnnData | str | os.PathLike],
+    *,
+    unstained: ad.AnnData | str | os.PathLike | None = None,
+    channels: Sequence[str] | None = None,
+    layer: str | None = None,
+    statistic: str = "median",
+    positive_gate: str | None = None,
+    thresholds: Mapping[str, float] | None = None,
+    cofactor: float = 150.0,
+    min_events: int = 20,
+    min_separation: float = 5.0,
+) -> pd.DataFrame:
+    """Compute a spillover matrix from single-stain controls (Bagwell and Adams).
+
+    For the control stained with dye *i*, the signal it contributes to every
+    detector *j* is the difference between its positive and negative
+    populations, ``d_j``. Dividing that row through by ``d_i`` — the difference
+    in the dye's own detector — gives spillover coefficients that are
+    independent of how bright the control happened to be, and puts ``1`` on the
+    diagonal by construction. Inverting the assembled matrix is what
+    :func:`~cytopy.compensate` then does, which is the N-parameter
+    generalisation Bagwell and Adams (1993) described.
+
+    The negative population is taken from the control itself, which is what you
+    want: it carries the same autofluorescence and the same beads as the
+    positives. Pass ``unstained`` to use a universal negative instead.
+
+    Parameters
+    ----------
+    controls
+        Maps detector to its single-stain control — ``{"FITC-A": adata}``, or
+        a path to the FCS file instead of an ``AnnData``. The key is resolved
+        like any other channel name, so ``$PnS`` markers (``"CD3"``) work too.
+        :func:`read_controls` builds this mapping from a directory.
+    unstained
+        Universal negative, as an ``AnnData`` or a path. When given, its
+        per-channel statistic is the negative reference for every control
+        rather than each control's own negative events.
+    channels
+        Detectors the matrix should cover. Defaults to the controls' own
+        detectors, which is the only square set the controls constrain. A
+        larger set is allowed — the extra detectors get identity rows, which
+        asserts they spill into nothing.
+    layer
+        Layer of each control to measure. ``None`` uses ``.X``.
+    statistic
+        ``"median"`` (default, robust) or ``"mean"`` (as in the original
+        paper). Applied to both populations.
+    positive_gate
+        Name of a boolean ``obs`` column marking the stained events, as
+        written by :func:`~cytopy.add_gate`. Falls back to the automatic split
+        for any control that lacks the column.
+    thresholds
+        Per-control cutoff on the stained detector, in raw units, keyed like
+        ``controls``. Overrides the automatic split. Pass ``-inf`` for a tube
+        with no negative population of its own — an all-positive bead control
+        — which only works alongside ``unstained``.
+    cofactor
+        Arcsinh cofactor for the automatic positive/negative split. It only
+        affects where the split is looked for, never the returned
+        coefficients; raise it if a dim control is being cut in the wrong
+        place.
+    min_events
+        Smallest acceptable positive or negative population. A control below
+        it cannot give a trustworthy median and is an error rather than a
+        quietly bad row of the matrix.
+    min_separation
+        How far apart the automatic split must put the two populations, in
+        negative-MAD units, before the control is believed to be stained at
+        all. Splitting a single noise population in half scores about 2; a
+        real control scores in the tens. Only checked when the split is
+        automatic — an explicit ``positive_gate`` or threshold is taken at
+        face value.
+
+    Returns
+    -------
+    DataFrame
+        Square spillover matrix indexed and columned by the resolved detector
+        names, with ``1`` on the diagonal. ``.attrs['cytopy']`` carries the
+        per-control event counts and thresholds for troubleshooting.
+
+    Raises
+    ------
+    ValueError
+        If ``controls`` is empty, a control does not separate into two
+        populations, a control's own detector shows no signal above its
+        negatives, or ``channels`` omits a detector that has a control.
+    KeyError
+        If a control is missing one of the detectors being solved for.
+    """
+    if not controls:
+        raise ValueError("no controls given")
+    _stat(np.zeros((1, 1)), statistic)  # fail on a bad statistic before reading files
+    loaded = {key: _as_anndata(value) for key, value in controls.items()}
+    reference = next(iter(loaded.values()))
+
+    # Resolve every control key to the reference panel's own channel name, so
+    # that "CD3", "FITC-A" and "CD3 (FITC-A)" all name the same row.
+    primary = {key: str(reference.var_names[channel_index(reference, key)]) for key in loaded}
+    if len(set(primary.values())) != len(primary):
+        raise ValueError(f"two controls resolve to the same detector: {sorted(primary.values())}")
+
+    if channels is None:
+        names = [n for n in fluor_channels(reference) if n in set(primary.values())]
+        names += [n for n in primary.values() if n not in names]
+    else:
+        names = [str(reference.var_names[channel_index(reference, c)]) for c in channels]
+        missing = sorted(set(primary.values()) - set(names))
+        if missing:
+            raise ValueError(f"channels omits detectors that have controls: {missing}")
+
+    background = None
+    if unstained is not None:
+        unstained = _as_anndata(unstained)
+        columns = [channel_index(unstained, n) for n in names]
+        matrix = unstained.X if layer is None else unstained.layers[layer]
+        background = _stat(np.asarray(matrix, dtype=np.float64)[:, columns], statistic)
+
+    spill = np.eye(len(names))
+    diagnostics: dict[str, dict[str, float]] = {}
+
+    for key, control in loaded.items():
+        detector = primary[key]
+        row = names.index(detector)
+        columns = [channel_index(control, n) for n in names]
+        matrix = np.asarray(
+            control.X if layer is None else control.layers[layer], dtype=np.float64
+        )[:, columns]
+        stained = matrix[:, row]
+
+        automatic = False
+        if thresholds is not None and key in thresholds:
+            threshold = float(thresholds[key])
+            positive = stained > threshold
+        elif positive_gate is not None and positive_gate in control.obs:
+            positive = np.asarray(control.obs[positive_gate], dtype=bool)
+            threshold = float("nan")
+        else:
+            positive, threshold = _positive_mask(stained, cofactor)
+            automatic = True
+
+        negative = ~positive
+        if positive.sum() < min_events:
+            raise ValueError(
+                f"control {key!r} has {int(positive.sum())} positive events in {detector} "
+                f"(need {min_events}); it may be too dim to split automatically"
+            )
+        if background is None and negative.sum() < min_events:
+            raise ValueError(
+                f"control {key!r} has {int(negative.sum())} negative events in {detector} "
+                f"(need {min_events}); pass an unstained control to use as the negative"
+            )
+
+        gap = _separation(stained, positive, min_events)
+        if automatic and gap < min_separation:
+            raise ValueError(
+                f"control {key!r} does not separate into two populations in {detector} "
+                f"(gap {gap:.1f} < {min_separation}); it may be the wrong tube, or too dim "
+                "to split automatically — pass positive_gate or thresholds"
+            )
+
+        baseline = background if background is not None else _stat(matrix[negative], statistic)
+        difference = _stat(matrix[positive], statistic) - baseline
+        if not difference[row] > 0:
+            raise ValueError(
+                f"control {key!r} is not brighter than its negatives in {detector}; "
+                "check that the control is matched to the right detector"
+            )
+        spill[row] = difference / difference[row]
+        diagnostics[detector] = {
+            "positive_events": int(positive.sum()),
+            "negative_events": int(negative.sum()),
+            "threshold": threshold,
+            "separation": gap,
+        }
+
+    out = pd.DataFrame(spill, index=pd.Index(names), columns=pd.Index(names))
+    out.attrs["cytopy"] = {
+        "method": "bagwell-adams",
+        "statistic": statistic,
+        "negative": "unstained" if background is not None else "internal",
+        "controls": diagnostics,
+    }
+    return out
+
+
+def read_controls(
+    directory: str | os.PathLike,
+    *,
+    pattern: str = "*.fcs",
+    recursive: bool = False,
+    unstained: str | None = None,
+    channels: Sequence[str] | None = None,
+    **kwargs,
+) -> tuple[dict[str, ad.AnnData], ad.AnnData | None]:
+    """Read a directory of single-stain controls and work out what each one stains.
+
+    Each file is matched to a detector by its name — ``FITC-A.fcs``,
+    ``Compensation Controls_PE-A.fcs``, ``CD3 FITC.fcs`` all match, punctuation
+    and case ignored, against both ``$PnN`` and ``$PnS``. A file whose name
+    matches nothing falls back to the detector with the widest gap between its
+    positive and negative populations, which is usually the same answer.
+
+    Parameters
+    ----------
+    directory
+        Directory of control files.
+    pattern
+        Glob matched against the file names.
+    recursive
+        Search sub-directories too.
+    unstained
+        Glob matched against file stems to pick out the universal negative.
+        When ``None``, names containing "unstained", "blank" and friends are
+        recognised.
+    channels
+        Detectors to consider. Defaults to :func:`~cytopy.fluor_channels` of
+        the first file read.
+    **kwargs
+        Passed through to :func:`~cytopy.read_fcs` for every file.
+
+    Returns
+    -------
+    tuple
+        ``(controls, unstained)`` — a mapping from detector name to its
+        control, ready for :func:`spillover_from_controls`, and the unstained
+        sample if one was found (``None`` otherwise).
+
+    Raises
+    ------
+    FileNotFoundError
+        If nothing matches ``pattern``.
+    ValueError
+        If two files claim the same detector.
+    """
+    from .io import read_fcs
+
+    directory = Path(directory)
+    globber = directory.rglob if recursive else directory.glob
+    paths = sorted(globber(pattern))
+    if not paths:
+        raise FileNotFoundError(f"no files matching {pattern!r} in {directory}")
+
+    negative: ad.AnnData | None = None
+    stained: list[tuple[Path, ad.AnnData]] = []
+    for path in paths:
+        adata = read_fcs(path, **kwargs)
+        is_negative = (
+            Path(path.stem).match(unstained)
+            if unstained is not None
+            else bool(_UNSTAINED_RE.search(path.stem))
+        )
+        if is_negative and negative is None:
+            negative = adata
+        else:
+            stained.append((path, adata))
+
+    controls: dict[str, ad.AnnData] = {}
+    for path, adata in stained:
+        names = list(channels) if channels is not None else fluor_channels(adata)
+        detector = _match_control(path, adata, names)
+        if detector in controls:
+            raise ValueError(f"{path.name} and another file both look like the {detector} control")
+        controls[detector] = adata
+    return controls, negative
+
+
+def _match_control(path: Path, adata: ad.AnnData, names: Sequence[str]) -> str:
+    """Pick the detector a control file stains, by file name then by signal."""
+    stem = _norm(path.stem)
+    best, best_len = None, 0
+    for name in names:
+        j = channel_index(adata, name)
+        candidates = [
+            str(adata.var[col].iloc[j]) for col in ("channel", "marker") if col in adata.var
+        ]
+        for candidate in candidates + [name]:
+            token = _norm(candidate)
+            if len(token) >= 2 and token in stem and len(token) > best_len:
+                best, best_len = name, len(token)
+    if best is not None:
+        return best
+
+    matrix = np.asarray(adata.X, dtype=np.float64)
+    scores = []
+    for name in names:
+        column = matrix[:, channel_index(adata, name)]
+        scores.append(_separation(column, _positive_mask(column, 150.0)[0], min_events=20))
+    if not scores or not np.isfinite(max(scores)):
+        raise ValueError(
+            f"cannot tell which detector {path.name} stains: the name matches none of "
+            f"{list(names)} and no channel splits into two populations"
+        )
+    return str(names[int(np.argmax(scores))])

@@ -1,0 +1,132 @@
+import numpy as np
+import pytest
+
+import cytopy
+
+
+def test_read_fcs(demo_path):
+    a = cytopy.read_fcs(demo_path)
+    assert a.shape == (60000, 6)
+    assert list(a.var["channel"]) == ["FSC-A", "SSC-A", "FITC-A", "PE-A", "APC-A", "Time"]
+    assert a.var.loc["CD3 (FITC-A)", "marker"] == "CD3"
+    assert list(a.var["kind"]) == ["scatter", "scatter", "fluor", "fluor", "fluor", "time"]
+    assert a.uns["spillover"].shape == (3, 3)
+    assert (a.obs["sample"] == "demo").all()
+
+
+def test_raw_layer_is_an_untouched_copy(demo):
+    assert np.array_equal(demo.layers["raw"], demo.X)
+    assert demo.layers["raw"] is not demo.X
+    before = demo.layers["raw"].copy()
+    cytopy.asinh_transform(demo, 150.0, key_added=None)  # overwrites .X
+    assert np.array_equal(demo.layers["raw"], before)
+    assert not np.array_equal(demo.X[:, 2], before[:, 2])
+
+
+def test_store_raw_can_be_turned_off(demo_path):
+    a = cytopy.read_fcs(demo_path, store_raw=False)
+    assert "raw" not in [k for k in a.layers if k is not None]
+
+
+def test_gain_is_opt_in(demo_path):
+    """$PnG is not applied unless asked for, so the two agree on a gain-1 file."""
+    default = cytopy.read_fcs(demo_path)
+    gained = cytopy.read_fcs(demo_path, apply_gain=True)
+    assert (default.var["png"] == 1.0).all()
+    assert np.array_equal(default.X, gained.X)
+
+
+def test_fluor_channels_excludes_scatter_and_time(demo):
+    assert cytopy.fluor_channels(demo) == ["CD3 (FITC-A)", "CD19 (PE-A)", "CD8 (APC-A)"]
+
+
+def test_channel_index_accepts_marker_and_channel(demo):
+    assert cytopy.channel_index(demo, "CD3") == 2
+    assert cytopy.channel_index(demo, "FITC-A") == 2
+    assert cytopy.channel_index(demo, "CD3 (FITC-A)") == 2
+    with pytest.raises(KeyError):
+        cytopy.channel_index(demo, "CD4")
+
+
+def test_compensate_recovers_the_uncontaminated_signal(demo):
+    fluor = [2, 3, 4]
+    truth = demo.X[:, fluor].astype(np.float64).copy()
+    spill = np.array([[1.0, 0.2, 0.0], [0.05, 1.0, 0.1], [0.0, 0.03, 1.0]])
+    demo.X[:, fluor] = (truth @ spill).astype(demo.X.dtype)
+
+    cytopy.compensate(
+        demo,
+        demo.uns["spillover"].__class__(
+            spill, index=cytopy.fluor_channels(demo), columns=cytopy.fluor_channels(demo)
+        ),
+    )
+    assert np.allclose(demo.layers["comp"][:, fluor], truth, rtol=1e-3, atol=1e-2)
+    # Channels outside the matrix pass straight through.
+    assert np.allclose(demo.layers["comp"][:, 0], demo.X[:, 0])
+
+
+def test_compensate_uses_the_spillover_from_the_file(demo):
+    cytopy.compensate(demo)
+    assert "comp" in demo.layers
+    assert demo.uns["cytopy"]["compensated_layer"] == "comp"
+
+
+def test_asinh_transform_scalar_cofactor(demo):
+    cytopy.asinh_transform(demo, 150.0)
+    out = demo.layers["asinh"]
+    assert np.allclose(out[:, 2], np.arcsinh(demo.X[:, 2] / 150.0), atol=1e-5)
+    # scatter and time are copied through untransformed
+    assert np.allclose(out[:, 0], demo.X[:, 0])
+    assert np.isnan(demo.var["cofactor"].iloc[0])
+    assert demo.var["cofactor"].iloc[2] == 150.0
+
+
+def test_asinh_transform_per_channel_cofactor(demo):
+    cytopy.asinh_transform(demo, {"CD3": 10.0, "default": 500.0})
+    assert demo.var["cofactor"].iloc[2] == 10.0
+    assert demo.var["cofactor"].iloc[3] == 500.0
+
+
+def test_asinh_transform_chains_off_a_layer(demo):
+    cytopy.compensate(demo)
+    cytopy.asinh_transform(demo, 150.0, layer="comp")
+    assert np.allclose(
+        demo.layers["asinh"][:, 2], np.arcsinh(demo.layers["comp"][:, 2] / 150.0), atol=1e-5
+    )
+
+
+def test_asinh_in_place_overwrites_X(demo):
+    before = demo.X.copy()
+    cytopy.asinh_transform(demo, 150.0, key_added=None)
+    assert not np.allclose(demo.X[:, 2], before[:, 2])
+    assert [k for k in demo.layers if k is not None] == ["raw"]
+
+
+def test_estimate_cofactors(demo):
+    cof = cytopy.estimate_cofactors(demo)
+    assert set(cof) == set(cytopy.fluor_channels(demo))
+    assert all(v > 1 for v in cof.values())
+
+
+def test_logicle_transform_maps_into_unit_interval(demo):
+    cytopy.logicle_transform(demo)
+    out = demo.layers["logicle"][:, 2]
+    assert out.min() >= -0.21 and out.max() <= 1.21
+    assert demo.uns["cytopy"]["logicle_params"]["CD3 (FITC-A)"]["M"] == 4.5
+
+
+def test_subsample(demo):
+    small = cytopy.subsample(demo, 1000)
+    assert small.n_obs == 1000
+    assert cytopy.subsample(demo, 10**9).n_obs == demo.n_obs
+
+
+def test_h5ad_roundtrip(demo, tmp_path):
+    cytopy.asinh_transform(demo, 150.0)
+    demo.uns.pop("spillover")
+    p = tmp_path / "demo.h5ad"
+    demo.write_h5ad(p)
+    import anndata
+
+    back = anndata.read_h5ad(p)
+    assert np.allclose(back.layers["asinh"], demo.layers["asinh"])
