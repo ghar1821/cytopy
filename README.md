@@ -59,9 +59,52 @@ assembled matrix is the N-parameter generalisation that lets every detector be
 corrected at once.
 
 The positive population is found by splitting the control's stained detector on
-an arcsinh scale (Otsu), or you can hand it one: `positive_gate="P1"` uses a
-boolean `obs` column, so a gate drawn in the viewer works, and `thresholds=`
-takes a raw cutoff per control. The negative reference is the control's own
+an arcsinh scale (Otsu), or you can gate it yourself:
+
+```python
+controls, unstained = cytopy.read_controls("controls/")
+everything = {**controls, "unstained": unstained}
+
+pooled = cytopy.gate(everything)      # ONE window, every control in it
+
+gated = cytopy.subset_controls(cytopy.split_samples(pooled), "singlets")
+unstained = gated.pop("unstained")
+spill = cytopy.spillover_from_controls(gated, unstained=unstained, positive_gate="positive")
+```
+
+There is no special function for controls — [`cytopy.gate`](#gating) is the same
+one you use on a sample, and it takes the whole dict at once. The controls are
+pooled into one object with a `sample` column, and the **samples** list picks
+which you are looking at. That matters because the gates are not all the same
+kind:
+
+| gate | samples selected |
+| --- | --- |
+| `cells` — `FSC-A` × `SSC-A` | **all**: scatter is scatter |
+| `singlets` — `FSC-A` × `FSC-H`, parent `cells` | **all** |
+| `positive` — the stained channel, parent `singlets` | **one at a time**: each tube stains a different channel |
+
+**A gate only changes the samples you are looking at**, so drawing `positive` on
+one tube and then the next under the same name keeps both. `split_samples`
+takes them apart again afterwards.
+
+**Gates already on the data are loaded** — outlined where you drew them, listed
+under *edit gate*, available as parents. Gating is something you come back to.
+
+The scatter pass matters more than it looks: every number in the matrix is a
+median, and a median over cells *and* debris is a median of nothing in
+particular. On a real six-colour panel it took the worst residual from 10.1%
+down to 4.7% before a single positive gate was drawn.
+
+Each control is its own AnnData, so the gate lives in *that* control's
+`obs["positive"]` and the same name works for all of them. A control with no
+gate falls back to the automatic split, so you can hand-gate only the awkward
+ones. `thresholds=` takes a raw cutoff per control instead.
+
+The gating is done on an arcsinh display — on a linear axis the whole negative
+population lands in one bin — but **the matrix is computed on the raw values**,
+because spillover is linear and `asinh(a) − asinh(b)` is not proportional to
+`a − b`. Transforming the controls first inflates the coefficients several-fold. The negative reference is the control's own
 negative events by default — same beads, same autofluorescence — or pass
 `unstained=` to use a universal negative instead. A control that does not split
 into two populations is an error rather than a quietly wrong row.
@@ -70,6 +113,31 @@ into two populations is an error rather than a quietly wrong row.
 name (`FITC-A.fcs`, `Compensation Controls_PE-A.fcs`, `CD3 FITC.fcs` all work,
 against both `$PnN` and `$PnS`), falling back to whichever channel separates
 best. It picks the unstained tube out by name too.
+
+**Adjusting one by hand.** The matrix is a DataFrame, so a coefficient is an
+assignment — and there are two ways to see whether the change helped:
+
+```python
+spill.loc["CD3 (FITC-A)", "CD19 (PE-A)"] = 0.13
+
+cytopy.compensation_residuals(controls, spill, unstained=unstained)
+#               CD3 (FITC-A)  CD19 (PE-A)  CD8 (APC-A)
+# CD3 (FITC-A)           0.0        0.070       -0.006   <- under-compensated
+# CD19 (PE-A)           -0.0        0.000       -0.000
+
+cytopy.plot_compensation(controls, spill, unstained=unstained)
+```
+
+A single-stain control compensated correctly has its positive population level
+with its negative one in every detector but its own. `compensation_residuals`
+measures exactly that — it derives a matrix *from the compensated controls*,
+which should come out as the identity, and reports what it is instead. Read a
+cell as the fraction of the dye's signal still leaking: **positive is
+under-compensated, negative is over-compensated**, zero is right.
+
+`plot_compensation` is the same thing to look at: a row per control, a column
+per detector, with a dashed line at the negative population's level. A
+population tipping up is under-compensated, one sliding down is over.
 
 **From a CSV.** `read_spillover` copes with what the common exporters write:
 with or without a row-name column, comma / tab / semicolon separated, fractions
@@ -317,6 +385,18 @@ from the first object, so per-file provenance (bead gates, spillover) beyond
 the first is not carried over; normalise and gate before combining if you need
 it kept.
 
+### Gating
+
+```python
+cytopy.gate(adata, layer="asinh")     # opens napari; returns when you close it
+```
+
+Gate as many times as you like in the one window: draw, apply, change the
+channels, set **parent gate** to what you just drew, gate again. Each gate is a
+boolean column in `adata.obs` and an outline in
+`adata.uns["cytopy"]["gates"]`. Call it again on the same object and those gates
+come back with it.
+
 ### In the viewer
 
 * Pick the two channels and the matrix to plot (`X` or any layer).
@@ -407,7 +487,9 @@ Reading a file undoes `$PnE` log amplification (analog log amps on older
 instruments store already-logged values; modern files write `$PnE = 0,0` and
 this does nothing). `$PnG` gain is **not** applied unless you pass
 `apply_gain=True` — instruments disagree about whether the gain is already
-baked into the stored values, matching flowCore's `linearize` default.
+baked into the stored values, matching flowCore's `linearize` default. Both
+follow flowCore exactly: log-undoing only ever runs on `$DATATYPE = I`
+channels, and a channel is never both log-linearised and gain-divided.
 
 ## Scales
 

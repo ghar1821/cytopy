@@ -28,9 +28,12 @@ import pandas as pd
 from .transforms import channel_index, fluor_channels
 
 __all__ = [
+    "compensate_controls",
+    "compensation_residuals",
     "read_controls",
     "read_spillover",
     "spillover_from_controls",
+    "subset_controls",
     "write_spillover",
 ]
 
@@ -278,7 +281,7 @@ def spillover_from_controls(
     thresholds: Mapping[str, float] | None = None,
     cofactor: float = 150.0,
     min_events: int = 20,
-    min_separation: float = 5.0,
+    min_separation: float = 0.0,
 ) -> pd.DataFrame:
     """Compute a spillover matrix from single-stain controls (Bagwell and Adams).
 
@@ -337,10 +340,14 @@ def spillover_from_controls(
     min_separation
         How far apart the automatic split must put the two populations, in
         negative-MAD units, before the control is believed to be stained at
-        all. Splitting a single noise population in half scores about 2; a
-        real control scores in the tens. Only checked when the split is
-        automatic — an explicit ``positive_gate`` or threshold is taken at
-        face value.
+        all. **Off by default**: the measure does not do the job it looks like
+        it does. On real controls a dim but genuine tube scores 3.5 while an
+        unstained tube scores 6.7, so any cutoff that passes the real one also
+        passes the empty one. It is kept for clean bead controls, where the two
+        are orders apart. The check that a control is brighter than its own
+        negatives always applies, and is the one that catches a mismatched
+        tube. Only consulted when the split is automatic -- an explicit
+        ``positive_gate`` or ``thresholds`` entry is taken at face value.
 
     Returns
     -------
@@ -422,7 +429,7 @@ def spillover_from_controls(
             )
 
         gap = _separation(stained, positive, min_events)
-        if automatic and gap < min_separation:
+        if automatic and min_separation and gap < min_separation:
             raise ValueError(
                 f"control {key!r} does not separate into two populations in {detector} "
                 f"(gap {gap:.1f} < {min_separation}); it may be the wrong tube, or too dim "
@@ -562,3 +569,130 @@ def _match_control(path: Path, adata: ad.AnnData, names: Sequence[str]) -> str:
             f"{list(names)} and no channel splits into two populations"
         )
     return str(names[int(np.argmax(scores))])
+
+
+def subset_controls(
+    controls: Mapping[str, ad.AnnData], gate: str, *, required: bool = True
+) -> dict[str, ad.AnnData]:
+    """Keep only the events inside a gate, in every control.
+
+    The step between gating and computing a matrix: what comes back holds the
+    cells and nothing else, so every median the matrix is built from is a
+    median of cells rather than of cells and debris together.
+
+    Parameters
+    ----------
+    controls
+        Maps detector to its control.
+    gate
+        ``obs`` column to subset on, as gated with :func:`~cytopy.gate`.
+    required
+        Raise if a control has no such column. ``False`` passes it through
+        whole, which is rarely what you want and never silent -- a control that
+        was missed makes a quietly wrong matrix rather than an error.
+
+    Returns
+    -------
+    dict
+        The same keys, each control cut down to the gate.
+
+    Raises
+    ------
+    KeyError
+        If ``required`` and a control was never gated.
+    ValueError
+        If a gate holds no events.
+    """
+    out = {}
+    for key, adata in controls.items():
+        if gate not in adata.obs:
+            if required:
+                raise KeyError(f"control {key!r} has no gate {gate!r}; gate it first")
+            print(f"control {key!r} has no gate {gate!r}, keeping all {adata.n_obs:,} events")
+            out[key] = adata
+            continue
+        mask = np.asarray(adata.obs[gate], dtype=bool)
+        if not mask.any():
+            raise ValueError(f"gate {gate!r} holds no events in control {key!r}")
+        out[key] = adata[mask].copy()
+    return out
+
+
+def compensate_controls(
+    controls: Mapping[str, ad.AnnData | str | os.PathLike],
+    spillover: pd.DataFrame | np.ndarray | str | os.PathLike,
+    *,
+    key_added: str = "comp",
+    layer: str | None = None,
+) -> dict[str, ad.AnnData]:
+    """Apply a matrix to every single-stain control.
+
+    Parameters
+    ----------
+    controls
+        Maps detector to its control, as :func:`read_controls` returns.
+    spillover
+        The matrix to try, in any form :func:`~cytopy.compensate` accepts.
+    key_added
+        Layer each control's compensated values are written to.
+    layer
+        Input layer. ``None`` uses ``.X``, which is where the raw counts are.
+
+    Returns
+    -------
+    dict
+        The controls, each with the compensated matrix in
+        ``layers[key_added]``.
+    """
+    from .transforms import compensate
+
+    loaded = {key: _as_anndata(value) for key, value in controls.items()}
+    for adata in loaded.values():
+        compensate(adata, spillover, layer=layer, key_added=key_added)
+    return loaded
+
+
+def compensation_residuals(
+    controls: Mapping[str, ad.AnnData | str | os.PathLike],
+    spillover: pd.DataFrame | np.ndarray | str | os.PathLike,
+    **kwargs,
+) -> pd.DataFrame:
+    """How far a matrix leaves each control from being compensated.
+
+    Compensate a single-stain control correctly and its positive population
+    sits level with its negative one in every detector but its own. Measuring
+    that is the same calculation as deriving a matrix in the first place, so
+    this derives one *from the compensated data*: the answer should be the
+    identity, and whatever it is instead is the error still in the matrix.
+
+    Read a cell as the fraction of the dye's own signal still leaking into that
+    detector. Positive is under-compensated, negative is over-compensated, and
+    the diagonal is always zero by construction.
+
+    Parameters
+    ----------
+    controls
+        Maps detector to its control, as :func:`read_controls` returns.
+    spillover
+        The matrix to test.
+    **kwargs
+        Passed to :func:`spillover_from_controls` -- ``unstained``,
+        ``positive_gate``, ``thresholds``, ``statistic`` and the rest, which
+        should match what the matrix was built with.
+
+    Returns
+    -------
+    DataFrame
+        Square, indexed and columned by detector, zero where the matrix is
+        right.
+    """
+    compensated = compensate_controls(controls, spillover, key_added="_residual")
+    if "unstained" in kwargs and kwargs["unstained"] is not None:
+        from .transforms import compensate
+
+        kwargs = dict(kwargs)
+        kwargs["unstained"] = compensate(
+            _as_anndata(kwargs["unstained"]), spillover, key_added="_residual", copy=True
+        )
+    out = spillover_from_controls(compensated, layer="_residual", **kwargs)
+    return out - np.eye(out.shape[0])

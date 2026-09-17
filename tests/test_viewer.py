@@ -1117,3 +1117,133 @@ def test_fill_and_line_share_a_colour(three):
     for i in range(2):
         assert np.allclose(faces[i][:3], edges[i + 2][:3])
     assert not np.allclose(edges[2][:3], edges[3][:3])  # ... but differ between samples
+
+
+# --------------------------------------------------------------------------
+# gating across several planes, and coming back to it
+# --------------------------------------------------------------------------
+def test_gates_on_different_channel_pairs_in_one_session(cv):
+    """A hierarchy is several plots, not one."""
+    cv.gates.add_polygons([_rect(cv, 2.0, 9.0, -2.0, 9.0)])
+    cv.apply_gate("cells")
+
+    cv.set_plot(x="CD8 (APC-A)", y="FSC-A", parent="cells")
+    cv.gates.add_polygons([_rect(cv, 2.0, 9.0, 0.0, 9e4)])
+    cv.apply_gate("cd8", parent="cells")
+
+    gates = cv.adata.uns["cytopy"]["gates"]
+    assert (gates["cells"]["x"], gates["cells"]["y"]) == ("CD3 (FITC-A)", "CD19 (PE-A)")
+    assert (gates["cd8"]["x"], gates["cd8"]["y"]) == ("CD8 (APC-A)", "FSC-A")
+    assert not (cv.adata.obs["cd8"] & ~cv.adata.obs["cells"]).any()
+
+
+def test_gates_are_loaded_when_the_data_is_opened_again(demo, make_napari_viewer):
+    """Gating is something you come back to, not do in one sitting."""
+    import cytopy
+    from cytopy.viewer import CytoViewer
+
+    cytopy.asinh_transform(demo, 150.0)
+    first = CytoViewer(demo, layer="asinh", x="CD3", y="CD19", bins=64, viewer=make_napari_viewer())
+    first.gates.add_polygons([_rect(first, 2.0, 9.0, -2.0, 9.0)])
+    first.apply_gate("cells")
+    n = int(demo.obs["cells"].sum())
+
+    again = CytoViewer(demo, layer="asinh", x="CD3", y="CD19", bins=64, viewer=make_napari_viewer())
+    assert len(again.applied.data) == 1  # outlined where it was drawn
+    assert "cells" in list(again.w_gate_pick.choices)
+    assert "cells" in list(again.w_parent.choices)
+
+    again.load_gate("cells")
+    again.apply_gate("cells")
+    assert int(demo.obs["cells"].sum()) == n  # unchanged by the round trip
+
+
+def test_gate_reports_what_was_already_there(demo, make_napari_viewer, capsys):
+    import cytopy
+
+    cytopy.asinh_transform(demo, 150.0)
+    cytopy.add_gate(demo, "earlier", np.ones(demo.n_obs, dtype=bool))
+    out = cytopy.gate(demo, layer="asinh", block=False, viewer=make_napari_viewer())
+    assert out is demo
+    printed = capsys.readouterr().out
+    assert "loaded 1 gate(s): earlier" in printed
+    assert "gated: nothing new" in printed
+
+
+# --------------------------------------------------------------------------
+# gating several files in one window
+# --------------------------------------------------------------------------
+@pytest.fixture
+def pooled(demo, demo_path, make_napari_viewer):
+    """Two files in one viewer, as a dict of samples."""
+    import cytopy
+    from cytopy.viewer import CytoViewer
+
+    cytopy.asinh_transform(demo, 150.0)
+    other = cytopy.read_fcs(demo_path, sample_id="b")
+    cytopy.asinh_transform(other, 150.0)
+    return CytoViewer(
+        {"a": demo, "b": other},
+        layer="asinh",
+        x="CD3",
+        y="CD19",
+        bins=128,
+        viewer=make_napari_viewer(),
+    )
+
+
+def test_a_gate_on_all_samples_covers_them_all(pooled):
+    pooled.gates.add_polygons([_rect(pooled, 2.0, 9.0, -2.0, 9.0)])
+    pooled.apply_gate("singlets")
+    labels = pooled.adata.obs["sample"].astype(str).to_numpy()
+    for name in ("a", "b"):
+        assert int(pooled.adata.obs["singlets"][labels == name].sum()) > 0
+
+
+def test_gating_one_sample_leaves_the_others_alone(pooled):
+    """The shared gates once, the per-file ones one at a time, same window."""
+    labels = pooled.adata.obs["sample"].astype(str).to_numpy()
+
+    pooled.set_plot(samples=["a"])
+    pooled.gates.add_polygons([_rect(pooled, 3.0, 9.0, 0.0, 4.0)])
+    pooled.apply_gate("positive")
+    first = int(pooled.adata.obs["positive"][labels == "a"].sum())
+    assert first > 0
+    assert int(pooled.adata.obs["positive"][labels == "b"].sum()) == 0
+
+    pooled.set_plot(samples=["b"])
+    pooled.gates.add_polygons([_rect(pooled, 3.0, 9.0, 0.0, 4.0)])
+    pooled.apply_gate("positive")
+    # b is gated now, and a still is -- the second apply used to wipe the first
+    assert int(pooled.adata.obs["positive"][labels == "a"].sum()) == first
+    assert int(pooled.adata.obs["positive"][labels == "b"].sum()) > 0
+
+
+def test_regating_a_sample_can_still_turn_events_off(pooled):
+    pooled.set_plot(samples=["a"])
+    pooled.gates.add_polygons([_rect(pooled, 2.0, 9.0, -2.0, 9.0)])
+    pooled.apply_gate("p")
+    wide = int(pooled.adata.obs["p"].sum())
+
+    pooled.gates.add_polygons([_rect(pooled, 6.0, 9.0, -2.0, 9.0)])
+    pooled.apply_gate("p")
+    assert int(pooled.adata.obs["p"].sum()) < wide  # narrowing really narrows
+
+
+def test_splitting_back_out_keeps_the_gates(pooled):
+    import cytopy
+
+    pooled.gates.add_polygons([_rect(pooled, 2.0, 9.0, -2.0, 9.0)])
+    pooled.apply_gate("singlets")
+    for name in ("a", "b"):
+        pooled.set_plot(samples=[name], parent="singlets")
+        pooled.gates.add_polygons([_rect(pooled, 3.0, 9.0, 0.0, 4.0)])
+        pooled.apply_gate("positive", parent="singlets")
+
+    out = cytopy.split_samples(pooled.adata)
+    assert sorted(out) == ["a", "b"]
+    for name, part in out.items():
+        assert part.n_obs == 60_000
+        assert int(part.obs["positive"].sum()) > 0
+        assert not (part.obs["positive"] & ~part.obs["singlets"]).any()
+        assert sorted(part.uns["cytopy"]["gates"]) == ["positive", "singlets"]

@@ -122,7 +122,7 @@ def test_spillover_from_controls_rejects_nonsense(controls):
     with pytest.raises(ValueError, match="no controls"):
         cytopy.spillover_from_controls({})
     with pytest.raises(ValueError, match="does not separate into two populations"):
-        cytopy.spillover_from_controls({"CD3": unstained})
+        cytopy.spillover_from_controls({"CD3": unstained}, min_separation=5.0)
     # A gate that picks the dim events instead of the bright ones.
     control = stained[FLUOR[0]].copy()
     column = np.asarray(control.X[:, cytopy.channel_index(control, FLUOR[0])])
@@ -285,3 +285,174 @@ def test_cli_derives_and_applies_a_matrix(demo_path, controls_dir, tmp_path, mon
 
     with pytest.raises(SystemExit):
         __main__.main([str(demo_path), "--compensate", "--controls", str(controls_dir)])
+
+
+# --------------------------------------------------------------------------
+# gating the controls by hand
+# --------------------------------------------------------------------------
+def test_a_matrix_built_from_hand_drawn_gates(controls, true_spillover, make_napari_viewer):
+    """The whole route: read, gate each control, compute from those gates."""
+    stained, unstained = controls
+
+    for key, control in stained.items():
+        cytopy.asinh_transform(control, 150.0)
+        cv = cytopy.view(control, layer="asinh", x=key, block=False, viewer=make_napari_viewer())
+        cv.set_plot(kind="histogram", x=key)
+        # drag an interval over the positive peak
+        box = cv.to_canvas(np.array([2.5, 2.5, 9.0, 9.0]), np.array([0, 1, 1, 0]))
+        cv.gates.add_rectangles([box])
+        cv.apply_gate("positive")
+
+    # each control keeps its own gate, because each is its own object
+    assert all("positive" in c.obs for c in stained.values())
+    assert all(int(c.obs["positive"].sum()) > 1000 for c in stained.values())
+
+    spill = cytopy.spillover_from_controls(
+        stained, unstained=unstained, positive_gate="positive", statistic="mean"
+    )
+    assert np.allclose(spill.to_numpy(), true_spillover, atol=0.005)
+
+
+def test_a_control_without_a_gate_falls_back_to_the_split(controls, true_spillover):
+    """One gated by hand, the rest automatic, in the same call."""
+    stained, unstained = controls
+    first = next(iter(stained))
+    control = stained[first]
+    column = np.asarray(control.X[:, cytopy.channel_index(control, first)])
+    control.obs["positive"] = column > 1000.0
+
+    spill = cytopy.spillover_from_controls(
+        stained, unstained=unstained, positive_gate="positive", statistic="mean"
+    )
+    assert np.allclose(spill.to_numpy(), true_spillover, atol=0.01)
+
+
+# --------------------------------------------------------------------------
+# trying a matrix out on the controls
+# --------------------------------------------------------------------------
+def test_compensate_controls_applies_to_every_tube(controls, true_spillover):
+    stained, _ = controls
+    out = cytopy.compensate_controls(stained, _matrix(true_spillover, list(stained)))
+    assert sorted(out) == sorted(stained)
+    for adata in out.values():
+        assert "comp" in adata.layers
+        assert not np.allclose(adata.layers["comp"], adata.X)
+
+
+def test_the_right_matrix_leaves_no_residual(controls, true_spillover):
+    """Compensate correctly and every positive population sits on its negative."""
+    stained, unstained = controls
+    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    residual = cytopy.compensation_residuals(stained, spill, unstained=unstained, statistic="mean")
+    assert np.abs(residual.to_numpy()).max() < 0.01
+    assert np.allclose(np.diag(residual), 0.0)  # zero by construction
+
+
+def test_the_residual_says_which_way_a_coefficient_is_wrong(controls):
+    """Positive is under-compensated, negative is over-compensated."""
+    stained, unstained = controls
+    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    dye, detector = "CD3 (FITC-A)", "CD19 (PE-A)"
+    assert spill.loc[dye, detector] == pytest.approx(0.12, abs=0.01)
+
+    too_low = spill.copy()
+    too_low.loc[dye, detector] = 0.05
+    under = cytopy.compensation_residuals(stained, too_low, unstained=unstained, statistic="mean")
+    assert under.loc[dye, detector] > 0.05
+
+    too_high = spill.copy()
+    too_high.loc[dye, detector] = 0.20
+    over = cytopy.compensation_residuals(stained, too_high, unstained=unstained, statistic="mean")
+    assert over.loc[dye, detector] < -0.05
+
+    # the untouched coefficients are unaffected either way
+    for frame in (under, over):
+        assert abs(frame.loc["CD19 (PE-A)", "CD8 (APC-A)"]) < 0.01
+
+
+def test_a_hand_edited_matrix_round_trips_through_compensate(controls, demo):
+    stained, unstained = controls
+    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    spill.loc["CD3 (FITC-A)", "CD19 (PE-A)"] = 0.15  # tweak one coefficient by hand
+
+    cytopy.compensate(demo, key_added="from_file")
+    cytopy.compensate(demo, spill, key_added="tweaked")
+    assert not np.allclose(demo.layers["tweaked"], demo.layers["from_file"])
+    assert demo.uns["cytopy"]["spillover_source"] == "argument"
+
+
+def test_the_separation_guard_is_off_by_default(controls):
+    """It cannot tell a dim control from an empty tube, so it must not be a default.
+
+    On real single-stain controls a genuine but dim tube scores about 3.5 in
+    negative-MAD units while an unstained tube scores 6.7, so any cutoff that
+    passes the real one passes the empty one too. The synthetic controls here
+    are cleaner than that, which is exactly how the measure looked trustworthy
+    until it met real data.
+    """
+    stained, unstained = controls
+    # an unstained tube sails through the automatic split ...
+    spill = cytopy.spillover_from_controls({"CD3": unstained})
+    assert spill.shape == (1, 1)
+    # ... so the check that does the real work is this one
+    control = stained[FLUOR[0]].copy()
+    column = np.asarray(control.X[:, cytopy.channel_index(control, FLUOR[0])])
+    control.obs["inverted"] = column < np.median(column)
+    with pytest.raises(ValueError, match="not brighter than its negatives"):
+        cytopy.spillover_from_controls({FLUOR[0]: control}, positive_gate="inverted")
+
+
+# --------------------------------------------------------------------------
+# gating the controls in two passes: cells, then positives
+# --------------------------------------------------------------------------
+def test_gating_controls_is_just_gate_in_a_loop(controls, make_napari_viewer):
+    """No wrapper: the same function that gates a sample gates a control."""
+    stained, unstained = controls
+    for control in {**stained, "unstained": unstained}.values():
+        cytopy.asinh_transform(control, 150.0)
+        out = cytopy.gate(control, layer="asinh", block=False, viewer=make_napari_viewer())
+        assert out is control
+
+
+def test_subset_controls_keeps_only_the_gated_events(controls):
+    stained, _ = controls
+    for control in stained.values():
+        fsc = np.asarray(control.X[:, cytopy.channel_index(control, "FSC-A")], dtype=float)
+        control.obs["cells"] = fsc > np.median(fsc)
+
+    gated = cytopy.subset_controls(stained, "cells")
+    for key, control in gated.items():
+        assert control.n_obs == int(stained[key].obs["cells"].sum())
+        assert control.n_obs < stained[key].n_obs
+        assert control.obs["cells"].all()
+    assert gated is not stained
+
+
+def test_subset_controls_says_when_a_control_was_never_gated(controls):
+    stained, _ = controls
+    with pytest.raises(KeyError, match="has no gate 'cells'"):
+        cytopy.subset_controls(stained, "cells")
+
+    for control in stained.values():
+        control.obs["cells"] = np.zeros(control.n_obs, dtype=bool)
+    with pytest.raises(ValueError, match="holds no events"):
+        cytopy.subset_controls(stained, "cells")
+
+
+def test_a_matrix_from_scatter_gated_controls(controls, true_spillover):
+    """The whole two-pass route: keep the cells, then find the positives."""
+    stained, unstained = controls
+    everything = {**stained, "unstained": unstained}
+    for control in everything.values():
+        fsc = np.asarray(control.X[:, cytopy.channel_index(control, "FSC-A")], dtype=float)
+        control.obs["cells"] = fsc > np.quantile(fsc, 0.1)
+
+    gated = cytopy.subset_controls(everything, "cells")
+    comp_adatas = {ch: gated[ch] for ch in stained}
+
+    spill = cytopy.spillover_from_controls(
+        comp_adatas, unstained=gated["unstained"], statistic="mean"
+    )
+    assert np.allclose(spill.to_numpy(), true_spillover, atol=0.01)
+    # and the controls really were cut down
+    assert all(comp_adatas[ch].n_obs < stained[ch].n_obs for ch in stained)

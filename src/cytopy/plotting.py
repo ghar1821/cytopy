@@ -21,7 +21,7 @@ from .density import Axes2D, density_image
 from .scales import AsinhScale, LinearScale, LogicleScale, PretransformedScale, Scale
 from .transforms import channel_index
 
-__all__ = ["plot_biaxial", "plot_gate"]
+__all__ = ["plot_biaxial", "plot_compensation", "plot_gate"]
 
 #: Events drawn when a plot colours points individually rather than by density.
 MAX_SCATTER = 50_000
@@ -56,6 +56,15 @@ def axis_scale(adata: ad.AnnData, channel: str, layer: str | None) -> Scale:
     if layer is None:
         return LinearScale()
     info = adata.uns.get("cytopy", {})
+    j = channel_index(adata, channel)
+    name = str(adata.var_names[j])
+    # Per-layer first: a file transformed twice keeps both.
+    cofactor = info.get("asinh_layers", {}).get(layer, {}).get(name)
+    if cofactor is not None:
+        return PretransformedScale(AsinhScale(cofactor=float(cofactor)))
+    params = info.get("logicle_layers", {}).get(layer, {}).get(name)
+    if params is not None:
+        return PretransformedScale(LogicleScale(**dict(params)))
     j = channel_index(adata, channel)
     if layer == info.get("asinh_layer") and "cofactor" in adata.var:
         cofactor = float(adata.var["cofactor"].iloc[j])
@@ -92,6 +101,8 @@ def plot_biaxial(
     log: bool = True,
     cmap: str = "turbo",
     robust: bool = True,
+    xlim: tuple[float, float] | None = None,
+    ylim: tuple[float, float] | None = None,
     title: str | None = None,
     ax=None,
 ):
@@ -140,7 +151,13 @@ def plot_biaxial(
         Colormap for the density.
     robust
         Clip the axes to the 0.1-99.9th percentile, so a few extreme events
-        cannot flatten the plot.
+        cannot flatten the plot. Ignored on whichever axis has an explicit
+        ``xlim``/``ylim``.
+    xlim, ylim
+        Explicit display-coordinate limits, overriding the ones ``robust``
+        would otherwise compute. For sharing one scale across several panels,
+        e.g. the same detector's axis across every control in
+        :func:`plot_compensation`.
     title
         Axes title. Defaults to the event count.
     ax
@@ -177,10 +194,17 @@ def plot_biaxial(
         x_scale = axis_scale(adata, x_name, layer)
         y_scale = axis_scale(adata, y_name, layer)
     quantiles = (0.001, 0.999) if robust else (0.0, 1.0)
-    if xv.size == 0:
-        x_lo, x_hi, y_lo, y_hi = 0.0, 1.0, 0.0, 1.0
+    if xlim is not None:
+        x_lo, x_hi = xlim
+    elif xv.size == 0:
+        x_lo, x_hi = 0.0, 1.0
     else:
         x_lo, x_hi = x_scale.limits(xv, quantiles=quantiles)
+    if ylim is not None:
+        y_lo, y_hi = ylim
+    elif yv.size == 0:
+        y_lo, y_hi = 0.0, 1.0
+    else:
         y_lo, y_hi = y_scale.limits(yv, quantiles=quantiles)
     axes2d = Axes2D(x_lo, x_hi, y_lo, y_hi, bins=bins)
 
@@ -198,12 +222,15 @@ def plot_biaxial(
         smooth=smooth,
         log=log,
     )
+    # Empty bins are left blank rather than painted the colormap's darkest
+    # colour, so a figure reads on a white page the way the canvas does.
+    shaded = plt.get_cmap(cmap if highlight is None else "Greys").with_extremes(bad=(0, 0, 0, 0))
     ax.imshow(
-        image,
+        np.where(image > 0, image, np.nan),
         extent=(x_lo, x_hi, y_lo, y_hi),
         origin="upper",
         aspect="auto",
-        cmap=cmap if highlight is None else "Greys",
+        cmap=shaded,
         interpolation="nearest",
     )
     if highlight is not None:
@@ -323,3 +350,193 @@ def plot_gate(adata: ad.AnnData, name: str, *, layer: str | None = None, ax=None
     kwargs.setdefault("subset", record.get("parent") or None)
     kwargs.setdefault("title", f"{name} ({int(record.get('n', 0)):,} events)")
     return plot_biaxial(adata, record["x"], record["y"], layer=layer, gate=name, ax=ax, **kwargs)
+
+
+def plot_compensation(
+    controls,
+    spillover,
+    *,
+    unstained=None,
+    cofactor: float = 150.0,
+    positive_gate: str | None = None,
+    bins: int = 256,
+    max_events: int | None = 100_000,
+    **kwargs,
+):
+    """Each single-stain control after compensation, one panel per detector.
+
+    The picture every cytometrist checks a matrix against: the dye on the x
+    axis, another detector on the y, and the positive population level with the
+    negative one. A population that tips up is under-compensated and one that
+    tips down is over-compensated, and the dashed line -- the negative
+    population's level -- is what it should be sitting on.
+
+    Parameters
+    ----------
+    controls
+        Maps detector to its single-stain control, as
+        :func:`~cytopy.read_controls` returns.
+    spillover
+        The matrix to try, in any form :func:`~cytopy.compensate` accepts.
+    unstained
+        Universal negative, drawn nowhere but used to place the line when a
+        control has no negative events of its own.
+    cofactor
+        Arcsinh cofactor for the display. Display only -- compensation happens
+        on the raw values.
+    positive_gate
+        ``obs`` column marking each control's positive events. Falls back to
+        splitting the stained channel at its midpoint, which is only used to
+        place the reference line.
+    bins
+        Resolution of each panel's density.
+    max_events
+        Events drawn per panel. ``None`` draws all of them; either way, axis
+        ranges are always taken from every event, not just the ones drawn.
+    **kwargs
+        Passed to :func:`plot_biaxial`. ``xlim``/``ylim`` are already set by
+        this function -- to the row's own full range on x, and on y to the
+        full range of that detector across every row -- and cannot be
+        overridden here.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        A row per control, a column per detector.
+
+    Raises
+    ------
+    ValueError
+        If ``controls`` is empty.
+    """
+    import matplotlib.pyplot as plt
+
+    from .spillover import compensate_controls
+
+    if not controls:
+        raise ValueError("no controls to plot")
+    compensated = compensate_controls(controls, spillover, key_added="_comp")
+    if unstained is not None:
+        from .transforms import compensate
+
+        unstained = compensate(unstained, spillover, key_added="_comp", copy=True)
+    names = list(compensated)
+    detectors = [
+        str(next(iter(compensated.values())).var_names[channel_index(a, c)])
+        for a, c in [(next(iter(compensated.values())), n) for n in names]
+    ]
+    stained = [str(compensated[dye].var_names[channel_index(compensated[dye], dye)]) for dye in names]
+
+    # One axis range per row and per column, from every event rather than a
+    # percentile, so a plot never lies about how far a population spreads --
+    # and shared across a column so the same detector means the same thing
+    # from row to row instead of each panel silently rescaling itself.
+    row_xlim = [_channel_range(compensated[dye], stained[row], cofactor) for row, dye in enumerate(names)]
+    col_ylim = [
+        _merge_ranges(_channel_range(compensated[dye], detector, cofactor, pad=False) for dye in names)
+        for detector in detectors
+    ]
+
+    fig, axes = plt.subplots(
+        len(names),
+        len(detectors),
+        figsize=(3.0 * len(detectors), 2.9 * len(names)),
+        squeeze=False,
+    )
+    for row, dye in enumerate(names):
+        adata = compensated[dye]
+        positive = _positive_events(adata, stained[row], positive_gate)
+        for col, detector in enumerate(detectors):
+            ax = axes[row][col]
+            plot_biaxial(
+                adata,
+                stained[row],
+                detector,
+                layer="_comp",
+                cofactor=cofactor,
+                bins=bins,
+                subset=_sample_of(adata, max_events),
+                xlim=row_xlim[row],
+                ylim=col_ylim[col],
+                title=f"{dye.split(' (')[0]} → {detector.split(' (')[0]}"
+                if row != col
+                else f"{dye.split(' (')[0]}",
+                ax=ax,
+                **kwargs,
+            )
+            if row == col:
+                continue
+            level = _negative_level(adata, detector, positive, unstained, cofactor)
+            if level is not None:
+                ax.axhline(level, color="#d62728", lw=1.0, ls="--")
+    fig.tight_layout()
+    return fig
+
+
+def _positive_events(adata, stained: str, positive_gate: str | None) -> np.ndarray:
+    """Which events are the stained population, for placing the reference line."""
+    if positive_gate and positive_gate in adata.obs:
+        return np.asarray(adata.obs[positive_gate], dtype=bool)
+    column = np.asarray(adata.layers["_comp"][:, channel_index(adata, stained)], dtype=np.float64)
+    return column > np.median(column)
+
+
+def _pad_range(lo: float, hi: float) -> tuple[float, float]:
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = lo - 0.5, lo + 0.5
+    pad = 0.02 * (hi - lo)
+    return lo - pad, hi + pad
+
+
+def _channel_range(
+    adata, channel: str, cofactor: float | None, *, pad: bool = True
+) -> tuple[float, float]:
+    """The full display-coordinate span of ``channel``, from every event.
+
+    Unlike :meth:`~cytopy.scales.Scale.limits` with a robust quantile, this
+    never clips -- the point is to show exactly how far a population spreads,
+    not to hide the tail.
+    """
+    values = np.asarray(
+        adata.layers["_comp"][:, channel_index(adata, channel)], dtype=np.float64
+    ).ravel()
+    values = np.arcsinh(values / cofactor) if cofactor is not None else axis_scale(
+        adata, channel, "_comp"
+    ).forward(values)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return (0.0, 1.0)
+    lo, hi = float(values.min()), float(values.max())
+    return _pad_range(lo, hi) if pad else (lo, hi)
+
+
+def _merge_ranges(ranges) -> tuple[float, float]:
+    """Combine several unpadded ``(lo, hi)`` spans into one, padded once."""
+    los, his = zip(*ranges)
+    return _pad_range(min(los), max(his))
+
+
+def _sample_of(adata, max_events: int | None):
+    if max_events is None or adata.n_obs <= max_events:
+        return None
+    take = np.random.default_rng(0).choice(adata.n_obs, max_events, replace=False)
+    mask = np.zeros(adata.n_obs, dtype=bool)
+    mask[take] = True
+    return mask
+
+
+def _negative_level(adata, detector, positive, unstained, cofactor) -> float | None:
+    """Where the positive population should sit: level with the negative one.
+
+    The control's own negatives first -- same beads, same autofluorescence --
+    falling back to a universal negative for a tube that has none of its own.
+    """
+    source, mask = adata, ~positive
+    if int(mask.sum()) < 10:
+        if unstained is None or "_comp" not in unstained.layers:
+            return None
+        source, mask = unstained, np.ones(unstained.n_obs, dtype=bool)
+    values = np.asarray(
+        source.layers["_comp"][:, channel_index(source, detector)], dtype=np.float64
+    )[mask]
+    return float(np.arcsinh(np.median(values) / cofactor))

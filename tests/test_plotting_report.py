@@ -408,3 +408,36 @@ def test_gating_pdf_needs_something_to_draw(demo, tmp_path):
     cytopy.add_gate(demo, "from a mask", np.ones(demo.n_obs, dtype=bool))
     with pytest.raises(ValueError, match="no gates with an outline"):
         cytopy.gating_pdf(demo, tmp_path / "empty.pdf")
+
+
+def test_plot_compensation_lays_out_a_control_grid(controls):
+    """A row per control, a column per detector, with the level to match marked."""
+    stained, unstained = controls
+    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    fig = cytopy.plot_compensation(stained, spill, unstained=unstained, max_events=5_000)
+
+    n = len(stained)
+    assert len(fig.axes) == n * n
+    off_diagonal = [ax for i, ax in enumerate(fig.axes) if i // n != i % n]
+    # every off-diagonal panel carries the negative population's level
+    for ax in off_diagonal:
+        assert any(line.get_linestyle() == "--" for line in ax.lines)
+    assert "→" in off_diagonal[0].get_title(loc="left")
+
+    with pytest.raises(ValueError, match="no controls to plot"):
+        cytopy.plot_compensation({}, spill)
+
+
+def test_over_compensation_pulls_the_population_below_the_line(controls):
+    stained, unstained = controls
+    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    bad = spill.copy()
+    bad.loc["CD3 (FITC-A)", "CD19 (PE-A)"] = 0.30
+
+    import cytopy as c
+
+    good = c.compensation_residuals(stained, spill, unstained=unstained, statistic="mean")
+    worse = c.compensation_residuals(stained, bad, unstained=unstained, statistic="mean")
+    assert abs(worse.loc["CD3 (FITC-A)", "CD19 (PE-A)"]) > abs(
+        good.loc["CD3 (FITC-A)", "CD19 (PE-A)"]
+    )

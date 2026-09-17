@@ -37,14 +37,17 @@ from .gating import (
     polygon_mask,
     recompute_gates,
 )
-from .io import concat_samples, read_fcs, read_fcs_dir
-from .plotting import plot_biaxial, plot_gate
+from .io import concat_samples, read_fcs, read_fcs_dir, split_samples
+from .plotting import plot_biaxial, plot_compensation, plot_gate
 from .report import gating_pdf, report
 from .scales import AsinhScale, LinearScale, LogicleScale, LogScale, get_scale
 from .spillover import (
+    compensate_controls,
+    compensation_residuals,
     read_controls,
     read_spillover,
     spillover_from_controls,
+    subset_controls,
     write_spillover,
 )
 from .transforms import (
@@ -82,6 +85,8 @@ __all__ = [
     "bead_gates",
     "channel_index",
     "compensate",
+    "compensate_controls",
+    "compensation_residuals",
     "concat_samples",
     "debarcode",
     "density_image",
@@ -92,6 +97,7 @@ __all__ = [
     "filter_events",
     "filter_log",
     "fluor_channels",
+    "gate",
     "gate_beads",
     "gate_children",
     "gate_mask",
@@ -105,6 +111,7 @@ __all__ = [
     "plot_bead_gates",
     "plot_beads_over_time",
     "plot_biaxial",
+    "plot_compensation",
     "plot_gate",
     "plot_yields",
     "polygon_mask",
@@ -117,7 +124,9 @@ __all__ = [
     "remove_beads",
     "report",
     "spillover_from_controls",
+    "split_samples",
     "subsample",
+    "subset_controls",
     "view",
     "write_spillover",
 ]
@@ -125,7 +134,7 @@ __all__ = [
 
 def __getattr__(name: str):
     # napari (and Qt) are heavy and optional: import them only on first use.
-    if name in ("view", "CytoViewer", "Panel", "faded_colormap", "as_one_anndata"):
+    if name in ("view", "gate", "CytoViewer", "Panel", "faded_colormap", "as_one_anndata"):
         from . import viewer as _viewer
 
         return getattr(_viewer, name)

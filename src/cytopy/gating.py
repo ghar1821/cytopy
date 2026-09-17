@@ -137,6 +137,7 @@ def add_gate(
     mask: np.ndarray,
     *,
     parent: str | None = None,
+    within: np.ndarray | None = None,
     meta: dict | None = None,
 ) -> np.ndarray:
     """Record a gate as a boolean column in ``adata.obs``.
@@ -154,6 +155,11 @@ def add_gate(
         Name of an existing gate to nest this one inside. The mask is
         intersected with it, so gates compose into a hierarchy the way they do
         in FlowJo. ``None`` gates the whole file.
+    within
+        Events this gate was drawn over. Anything outside keeps whatever it
+        had, so a gate can be drawn one sample at a time under a single name:
+        gating the second does not wipe the first. ``None`` rewrites the whole
+        column.
     meta
         Extra provenance (plotted channels, layer, ...) merged into the gate's
         record in ``adata.uns['cytopy']['gates'][name]``.
@@ -177,9 +183,20 @@ def add_gate(
         if parent not in adata.obs:
             raise KeyError(f"parent gate {parent!r} not in adata.obs")
         mask = mask & adata.obs[parent].to_numpy(dtype=bool)
+    if within is not None:
+        scope = np.asarray(within, dtype=bool)
+        if scope.shape[0] != adata.n_obs:
+            raise ValueError(f"within has {scope.shape[0]} entries, expected {adata.n_obs}")
+        previous = (
+            adata.obs[name].to_numpy(dtype=bool)
+            if name in adata.obs
+            else np.zeros(adata.n_obs, dtype=bool)
+        )
+        mask = np.where(scope, mask, previous)
     adata.obs[name] = pd.Series(mask, index=adata.obs_names)
     gates = adata.uns.setdefault("cytopy", {}).setdefault("gates", {})
-    gates[name] = {"parent": parent or "", "n": int(mask.sum()), **(meta or {})}
+    record = gates.get(name, {}) if within is not None else {}
+    gates[name] = {**record, "parent": parent or "", "n": int(mask.sum()), **(meta or {})}
     return mask
 
 

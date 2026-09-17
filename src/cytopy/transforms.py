@@ -271,7 +271,12 @@ def asinh_transform(
     else:
         adata.layers[key_added] = out
     adata.var["cofactor"] = cofs
-    adata.uns.setdefault("cytopy", {})["asinh_layer"] = key_added
+    info = adata.uns.setdefault("cytopy", {})
+    info["asinh_layer"] = key_added
+    # Per layer as well, so a second transform does not orphan the first.
+    info.setdefault("asinh_layers", {})[str(key_added)] = {
+        str(n): float(c) for n, c in zip(adata.var_names, cofs) if np.isfinite(c)
+    }
     return adata
 
 
@@ -397,8 +402,12 @@ def logicle_transform(
         adata.X = out
     else:
         adata.layers[key_added] = out
-    adata.uns.setdefault("cytopy", {})["logicle_params"] = params
-    adata.uns["cytopy"]["logicle_layer"] = key_added
+    info = adata.uns.setdefault("cytopy", {})
+    info["logicle_params"] = params
+    info["logicle_layer"] = key_added
+    # Also by layer: transforming twice -- raw and compensated, say -- used to
+    # leave the first layer unlabelled, because there was only ever one slot.
+    info.setdefault("logicle_layers", {})[str(key_added)] = params
     return adata
 
 

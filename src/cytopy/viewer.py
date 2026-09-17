@@ -49,7 +49,7 @@ DEFAULT_BACKGROUND = "white"
 #: the background instead of the colormap's darkest colour.
 _FADE = 0.02
 
-_TEXT_STYLE = {"size": 9, "anchor": "center"}
+_TEXT_STYLE = {"size": 12, "anchor": "center"}
 
 _PANEL = "panel"
 _COMPARE = "density (compare)"
@@ -977,6 +977,31 @@ class CytoViewer:
     def _matrix(self, layer: str):
         return self.adata.X if layer == "X" else self.adata.layers[layer]
 
+    def sample_scope(self, panel: Panel | None = None) -> np.ndarray:
+        """Events belonging to the samples the plot is showing.
+
+        The parent gate is deliberately not applied: this is what a gate is
+        allowed to *change*, and re-gating a sample should still be able to
+        turn an event off.
+
+        Parameters
+        ----------
+        panel
+            Which panel; the active one by default.
+
+        Returns
+        -------
+        ndarray
+            Boolean mask over all events, all ``True`` when no sample is
+            picked.
+        """
+        panel = panel or self.panel
+        mask = np.ones(self.adata.n_obs, dtype=bool)
+        if panel.samples and "sample" in self.adata.obs:
+            labels = self.adata.obs["sample"].astype(str).to_numpy()
+            mask &= np.isin(labels, list(panel.samples))
+        return mask
+
     def selection_mask(self, panel: Panel | None = None, *, sample: bool = True) -> np.ndarray:
         """Events a panel plots: its sample, narrowed by its parent gate.
 
@@ -1015,6 +1040,14 @@ class CytoViewer:
         if self.w_ticks.value == "linear" or layer == "X" or not channel:
             return LinearScale()
         info = self.adata.uns.get("cytopy", {})
+        name = str(self.adata.var_names[channel_index(self.adata, channel)])
+        # Per-layer first: a file transformed twice keeps both labelled.
+        cofactor = info.get("asinh_layers", {}).get(layer, {}).get(name)
+        if cofactor is not None:
+            return PretransformedScale(AsinhScale(cofactor=float(cofactor)))
+        params = info.get("logicle_layers", {}).get(layer, {}).get(name)
+        if params is not None:
+            return PretransformedScale(LogicleScale(**dict(params)))
         j = channel_index(self.adata, channel)
         if layer == info.get("asinh_layer") and "cofactor" in self.adata.var:
             cof = float(self.adata.var["cofactor"].iloc[j])
@@ -1567,10 +1600,12 @@ class CytoViewer:
     def load_gate(self, name: str) -> None:
         """Put a gate back on the canvas, in the plane it was drawn in, to adjust.
 
-        The active panel switches to the gate's channels, layer and parent, the
-        outline reappears on the **gates** layer, and the name box is filled in
-        -- so adjusting it and hitting *apply* replaces the gate rather than
-        adding another. Its children are recomputed when you do.
+        The active panel switches to the gate's plot kind, channels, layer and
+        parent, the outline reappears on the **gates** layer, and the name box
+        is filled in -- so adjusting it and hitting *apply* replaces the gate
+        rather than adding another. Its children are recomputed when you do.
+        A gate recorded before this switched panel kind back to density
+        defaults to density too, since nothing was saved to tell them apart.
 
         Parameters
         ----------
@@ -1597,7 +1632,7 @@ class CytoViewer:
         panel.layer = str(record.get("layer", panel.layer)) or "X"
         # Its own parent, not itself: a gate cannot be nested inside itself.
         panel.parent = str(record.get("parent") or "<none>")
-        panel.kind = "density"
+        panel.kind = str(record.get("kind", "density"))
         self._bind()
         self.refresh()
 
@@ -1691,7 +1726,11 @@ class CytoViewer:
             name,
             self.current_gate_mask(),
             parent=parent,
+            # Only the samples on screen: gating one file does not undo the
+            # gate drawn on another under the same name.
+            within=self.sample_scope(),
             meta={
+                "kind": self.panel.kind,
                 "x": str(self.w_x.value),
                 "y": str(self.w_y.value),
                 "layer": str(self.w_layer.value),
@@ -1865,6 +1904,62 @@ def _hide_overlays(viewer) -> None:
         legacy = getattr(viewer, path[-1], None)  # napari < 0.9
         if legacy is not None:
             legacy.visible = False
+
+
+def gate(
+    adata,
+    *,
+    layer: str | None = None,
+    cofactor: float | None = None,
+    block: bool | None = None,
+    **kwargs,
+) -> ad.AnnData:
+    """Open napari to gate some data, and hand the data back when you close it.
+
+    Gate as many times as you like in the one window: draw on one pair of
+    channels, apply, change the channels, set **parent gate** to what you just
+    drew, gate again. Each gate becomes a boolean column in ``adata.obs`` and
+    its outline is recorded in ``adata.uns['cytopy']['gates']``.
+
+    **Gates already on the data are loaded.** Call this again on the same
+    object and they are outlined where you drew them, listed under **edit
+    gate**, and available as parents -- so gating is something you come back
+    to rather than do in one sitting.
+
+    Parameters
+    ----------
+    adata
+        What to gate, or anything :func:`view` accepts. Modified in place.
+    layer
+        Matrix to plot. ``None`` uses ``adata.X``.
+    cofactor
+        Arcsinh cofactor. Given with a ``layer`` that does not exist yet, the
+        layer is made with it first, so a raw file can be gated on a sensible
+        scale without a separate step.
+    block
+        Wait for the window to close before returning. Defaults to ``True``
+        from a script, ``False`` under IPython, as :func:`view` does.
+    **kwargs
+        Passed to :func:`view` -- ``x``, ``y``, ``bins``, ``background`` and
+        the rest.
+
+    Returns
+    -------
+    AnnData
+        The data, with whatever you gated on it.
+    """
+    from .transforms import asinh_transform
+
+    adata = as_one_anndata(adata)
+    if layer is not None and layer not in adata.layers and cofactor is not None:
+        asinh_transform(adata, cofactor, key_added=layer)
+    existing = list(adata.uns.get("cytopy", {}).get("gates", {}))
+    if existing:
+        print(f"loaded {len(existing)} gate(s): {', '.join(existing)}")
+    view(adata, layer=layer, block=block, **kwargs)
+    drawn = [g for g in adata.uns.get("cytopy", {}).get("gates", {}) if g not in existing]
+    print(f"gated: {', '.join(drawn) if drawn else 'nothing new'}")
+    return adata
 
 
 def view(adata, *, block: bool | None = None, **kwargs) -> CytoViewer:

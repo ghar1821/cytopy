@@ -130,3 +130,43 @@ def test_h5ad_roundtrip(demo, tmp_path):
 
     back = anndata.read_h5ad(p)
     assert np.allclose(back.layers["asinh"], demo.layers["asinh"])
+
+
+def test_transforming_twice_keeps_both_layers_labelled(demo):
+    """Raw and compensated, say. One slot meant the first lost its raw-unit ticks."""
+    cytopy.compensate(demo)
+    cytopy.logicle_transform(demo, layer="raw", key_added="logicle")
+    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle")
+
+    info = demo.uns["cytopy"]
+    assert set(info["logicle_layers"]) == {"logicle", "comp_logicle"}
+    for layer in ("logicle", "comp_logicle"):
+        assert "CD3 (FITC-A)" in info["logicle_layers"][layer]
+
+    cytopy.asinh_transform(demo, 150.0, key_added="a1")
+    cytopy.asinh_transform(demo, 5.0, key_added="a2")
+    assert info["asinh_layers"]["a1"]["CD3 (FITC-A)"] == 150.0
+    assert info["asinh_layers"]["a2"]["CD3 (FITC-A)"] == 5.0
+
+
+def test_both_layers_get_raw_unit_ticks(demo):
+    from cytopy.plotting import axis_scale
+    from cytopy.scales import PretransformedScale
+
+    cytopy.compensate(demo)
+    cytopy.logicle_transform(demo, layer="raw", key_added="logicle")
+    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle")
+    for layer in ("logicle", "comp_logicle"):
+        assert isinstance(axis_scale(demo, "CD3", layer), PretransformedScale)
+
+
+def test_split_samples_is_the_other_end_of_concat(demo, demo_path):
+    other = cytopy.read_fcs(demo_path, sample_id="run2")
+    pooled = cytopy.concat_samples([demo, other])
+    parts = cytopy.split_samples(pooled)
+
+    assert list(parts) == ["demo", "run2"]
+    assert all(p.n_obs == 60_000 for p in parts.values())
+    assert np.array_equal(parts["demo"].X, demo.X)
+    with pytest.raises(KeyError, match="nothing to split on"):
+        cytopy.split_samples(demo, key="absent")

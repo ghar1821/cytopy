@@ -14,7 +14,7 @@ import pandas as pd
 
 from .spillover import _parse_spillover_keyword
 
-__all__ = ["concat_samples", "read_fcs", "read_fcs_dir"]
+__all__ = ["concat_samples", "read_fcs", "read_fcs_dir", "split_samples"]
 
 # Channels that are not fluorescence measurements and should be excluded from
 # transformation / compensation by default.
@@ -30,67 +30,40 @@ def _channel_kind(pnn: str) -> str:
     return "fluor"
 
 
-def _parse_pne(value: str | None) -> tuple[float, float]:
-    """Parse a ``$PnE`` amplification keyword into ``(decades, offset)``."""
-    if not value:
-        return (0.0, 0.0)
-    parts = [p.strip() for p in str(value).split(",")]
-    try:
-        f1 = float(parts[0])
-        f2 = float(parts[1]) if len(parts) > 1 else 0.0
-    except ValueError:
-        return (0.0, 0.0)
-    # A zero offset with non-zero decades means "1" by the FCS3.1 spec.
-    if f1 > 0 and f2 == 0:
-        f2 = 1.0
-    return (f1, f2)
-
-
 def _linearise(x: np.ndarray, f1: float, f2: float, pnr: float) -> np.ndarray:
     """Undo log amplification stored via ``$PnE`` (mostly FCS2.0 files)."""
-    if f1 <= 0:
-        return x
     return f2 * np.power(10.0, f1 * x / pnr)
 
 
 def _build_var(flow_data, channel_count: int) -> pd.DataFrame:
-    """Pivot the flat ``$Pn*`` keywords into one row per channel.
+    """Pivot flowio's per-channel metadata into one row per channel.
 
-    An FCS TEXT segment stores channel metadata as numbered keywords —
-    ``$P1N``, ``$P1S``, ``$P2N``, ... — so it has to be transposed into a table
-    before it can be ``adata.var``. flowio's own ``.channels`` only exposes
-    ``$PnN`` and ``$PnS``; ``$PnR`` and ``$PnE`` are needed to linearise log
-    amplification, and ``$PnG`` for gain.
+    flowio parses the flat ``$Pn*`` TEXT keywords (``$P1N``, ``$P1S``, ...)
+    into ``flow_data.channels`` for us, already including ``$PnR``, ``$PnE``
+    and ``$PnG`` alongside ``$PnN``/``$PnS`` -- this just transposes that into
+    a table that can be ``adata.var``.
 
     The ``label`` and ``kind`` columns are cytopy's, not the file's: ``label``
     is the marker-and-detector name used for the var index and the axis titles,
     ``kind`` is the scatter/fluor/time split that decides which channels
     transforms and compensation touch by default.
     """
-    text = {k.lower().lstrip("$"): v for k, v in flow_data.text.items()}
     rows = []
     for i in range(1, channel_count + 1):
-        pnn = str(text.get(f"p{i}n", f"P{i}")).strip()
-        pns = str(text.get(f"p{i}s", "")).strip()
-        try:
-            pnr = float(text.get(f"p{i}r", 262144))
-        except (TypeError, ValueError):
-            pnr = 262144.0
-        try:
-            png = float(text.get(f"p{i}g", 1) or 1)
-        except (TypeError, ValueError):
-            png = 1.0
-        f1, f2 = _parse_pne(text.get(f"p{i}e"))
+        chan = flow_data.channels[i]
+        pnn = str(chan["pnn"]).strip()
+        pns = str(chan["pns"]).strip()
+        pne_decades, pne_offset = chan["pne"]
         rows.append(
             {
                 "channel": pnn,
                 "marker": pns,
                 "label": f"{pns} ({pnn})" if pns and pns != pnn else pnn,
                 "kind": _channel_kind(pnn),
-                "pnr": pnr,
-                "png": png,
-                "pne_decades": f1,
-                "pne_offset": f2,
+                "pnr": chan["pnr"],
+                "png": chan["png"],
+                "pne_decades": pne_decades,
+                "pne_offset": pne_offset,
             }
         )
     var = pd.DataFrame(rows)
@@ -137,16 +110,22 @@ def read_fcs(
     sample_id
         Name recorded in ``adata.obs['sample']``. Defaults to the file stem.
     linearise
-        Undo ``$PnE`` log amplification. Older instruments stored the output of
-        an analog log amplifier, where the true intensity is
+        Undo ``$PnE`` log amplification, matching flowCore's default
+        ``read.FCS(transformation="linearize")``. Older instruments stored the
+        output of an analog log amplifier, where the true intensity is
         ``f2 * 10 ** (f1 * value / $PnR)``; leaving that alone would mean
         transforming already-logged values. Modern digital files write
-        ``$PnE = 0,0`` and this is a no-op.
+        ``$PnE = 0,0`` and ``$DATATYPE`` is float/double rather than integer,
+        so this is a no-op for them either way: like flowCore, it is only
+        ever applied to channels with ``$DATATYPE = I``.
     apply_gain
-        Divide linear channels by their ``$PnG`` gain. Off by default, matching
-        flowCore's ``linearize``: instruments disagree about whether the gain
-        has already been applied to the stored values, so applying it blindly
-        silently rescales the data. Turn it on if you know your files need it.
+        Divide by ``$PnG`` gain, matching flowCore's
+        ``read.FCS(transformation="linearize-with-PnG-scaling")``. Off by
+        default: instruments disagree about whether the gain has already
+        been applied to the stored values, so applying it blindly silently
+        rescales the data. A channel is never both log-linearised and
+        gain-divided -- as in flowCore, the two are mutually exclusive per
+        channel, so this only affects channels ``linearise`` left alone.
     store_raw
         Keep an untouched copy of the values in ``adata.layers['raw']``, so
         later transforms always have something to go back to. Costs one extra
@@ -173,18 +152,15 @@ def read_fcs(
     fd = flowio.FlowData(str(path), ignore_offset_error=ignore_offset_error)
 
     n_ch = int(fd.channel_count)
-    X = np.reshape(np.asarray(fd.events, dtype=np.float64), (-1, n_ch))
+    X = fd.as_array(preprocess=False)
     var = _build_var(fd, n_ch)
 
-    if linearise:
-        for j, (_, row) in enumerate(var.iterrows()):
-            if row["pne_decades"] > 0:
-                X[:, j] = _linearise(X[:, j], row["pne_decades"], row["pne_offset"], row["pnr"])
-    if apply_gain:
-        gains = var["png"].to_numpy(dtype=float)
-        linear = var["pne_decades"].to_numpy(dtype=float) <= 0
-        scale = np.where(linear & (gains > 0), gains, 1.0)
-        X = X / scale
+    is_integer_stored = fd.data_type.lower() == "i"
+    for j, (_, row) in enumerate(var.iterrows()):
+        if linearise and is_integer_stored and row["pne_decades"] > 0:
+            X[:, j] = _linearise(X[:, j], row["pne_decades"], row["pne_offset"], row["pnr"])
+        elif apply_gain and row["png"] > 0 and row["png"] != 1:
+            X[:, j] = X[:, j] / row["png"]
 
     name = sample_id or path.stem
     obs = pd.DataFrame(
@@ -274,4 +250,39 @@ def concat_samples(adatas: Sequence[ad.AnnData] | Iterable[ad.AnnData]) -> ad.An
         warnings.filterwarnings("ignore", message=".*Observation names are not unique.*")
         out = ad.concat(adatas, join="inner", index_unique=None, merge="first", uns_merge="first")
     out.obs_names_make_unique()
+    return out
+
+
+def split_samples(adata: ad.AnnData, key: str = "sample") -> dict[str, ad.AnnData]:
+    """Split a concatenated object back into one AnnData per sample.
+
+    The other end of :func:`concat_samples`: gate several files together in one
+    window, then take them apart again for anything that works file by file --
+    deriving a spillover matrix from single-stain controls, say.
+
+    Gates come with them, since they are ``obs`` columns.
+
+    Parameters
+    ----------
+    adata
+        AnnData with a sample column.
+    key
+        ``obs`` column naming the sample each event came from.
+
+    Returns
+    -------
+    dict
+        Maps sample name to its events, in the order the samples appear.
+
+    Raises
+    ------
+    KeyError
+        If ``key`` is not an ``obs`` column.
+    """
+    if key not in adata.obs:
+        raise KeyError(f"no obs column {key!r}; nothing to split on")
+    labels = adata.obs[key].astype(str).to_numpy()
+    out: dict[str, ad.AnnData] = {}
+    for name in pd.unique(labels):
+        out[str(name)] = adata[labels == name].copy()
     return out
