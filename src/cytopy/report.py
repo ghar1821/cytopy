@@ -2,9 +2,8 @@
 
 One file, no assets beside it, openable anywhere. It pulls together what the
 pipeline recorded as it ran -- the filter log, the gates and the channels they
-were drawn on, the bead normalisation, the debarcoding -- so the report is a
-record of what actually happened rather than something assembled by hand
-afterwards.
+were drawn on -- so the report is a record of what actually happened rather
+than something assembled by hand afterwards.
 """
 
 from __future__ import annotations
@@ -21,11 +20,13 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
+from ._util import subsample_indices
+
 __all__ = ["gating_pdf", "report"]
 
 #: Sections drawn when none are named, in order. Each is skipped when the data
 #: carries nothing for it.
-SECTIONS = ("summary", "filters", "beads", "gates", "debarcode")
+SECTIONS = ("summary", "filters", "gates")
 
 _CSS = """
 :root { color-scheme: light dark; }
@@ -97,10 +98,9 @@ def report(
     title: str = "cytopy QC report",
     sections: Sequence[str] | None = None,
     dpi: int = 110,
-    beads: ad.AnnData | None = None,
     subsample: int | None = 500_000,
     max_gates: int = 12,
-    max_barcodes: int = 20,
+    seed: int = 0,
 ) -> Path:
     """Write an HTML report of what a pipeline did to this data.
 
@@ -119,19 +119,15 @@ def report(
         every one the data has something for.
     dpi
         Resolution of the embedded figures.
-    beads
-        The object as it was *before* the beads were removed, so the bead-gate
-        panels can show what the gate took. Not needed for the before/after
-        line plot, which normalisation stashes and which therefore survives
-        the removal.
     subsample
         Events to draw the biaxial plots from, sampled once and reused.
         ``None`` draws all of them. The default keeps a report on a run of
         millions of events quick without visibly changing a density.
     max_gates
         Most gate panels to draw, newest first.
-    max_barcodes
-        Most barcode populations to draw yield and event panels for.
+    seed
+        Seed for that subsample, so a report redrawn from the same data shows
+        the same events.
 
     Returns
     -------
@@ -152,13 +148,11 @@ def report(
     if unknown:
         raise ValueError(f"unknown report section(s) {unknown}; choose from {list(SECTIONS)}")
 
-    plotted = _thin(adata, subsample)
+    plotted = _thin_events(adata, subsample, seed)
     builders = {
         "summary": lambda: _summary_section(adata),
         "filters": lambda: _filters_section(adata, dpi),
-        "beads": lambda: _beads_section(adata, _thin(beads, subsample), dpi),
         "gates": lambda: _gates_section(adata, plotted, dpi, max_gates),
-        "debarcode": lambda: _debarcode_section(adata, dpi, max_barcodes),
     }
     body = "".join(filter(None, (builders[name]() for name in chosen)))
 
@@ -176,12 +170,17 @@ def report(
     return path
 
 
-def _thin(adata: ad.AnnData | None, subsample: int | None) -> ad.AnnData | None:
-    """A stable subsample for the biaxial plots; a density does not need every event."""
-    if adata is None or subsample is None or adata.n_obs <= subsample:
+def _thin_events(
+    adata: ad.AnnData | None, subsample: int | None, seed: int = 0
+) -> ad.AnnData | None:
+    """A stable subsample for the biaxial plots; a density does not need every event.
+
+    Returns a view rather than a copy: the report only reads from it.
+    """
+    if adata is None:
         return adata
-    take = np.random.default_rng(0).choice(adata.n_obs, subsample, replace=False)
-    return adata[np.sort(take)]
+    take = subsample_indices(adata.n_obs, subsample, rng=np.random.default_rng(seed))
+    return adata if take is None else adata[take]
 
 
 # --------------------------------------------------------------------------
@@ -248,58 +247,8 @@ def _waterfall(log: pd.DataFrame):
     return fig
 
 
-def _beads_section(adata: ad.AnnData, gated: ad.AnnData | None, dpi: int) -> str:
-    info = adata.uns.get("cytopy", {}).get("beads")
-    if not info:
-        return ""
-    from .beads import plot_bead_gates, plot_beads_over_time
-
-    out = _heading("Bead normalisation")
-    samples = info.get("samples")
-    if samples:
-        frame = pd.DataFrame(samples).T
-        frame.index.name = "sample"
-        out += _table(frame)
-    baseline = info.get("baseline")
-    if baseline:
-        out += (
-            '<p class="note">Normalised onto '
-            + html.escape(", ".join(f"{k} {float(v):,.1f}" for k, v in baseline.items()))
-            + f" ({html.escape(str(info.get('statistic', '')))} of the bead events, "
-            f"window {info.get('k', '')}).</p>"
-        )
-    key = info.get("key", "bead")
-    try:
-        out += _figure(
-            plot_beads_over_time(adata, bead_key=key),
-            "smoothed bead intensities against time, before and after normalisation; "
-            "flat lines on their baselines mean the drift is gone",
-            dpi,
-        )
-    except (KeyError, ValueError):
-        pass
-
-    source = gated if gated is not None else adata
-    if key in source.obs and bool(np.any(np.asarray(source.obs[key], dtype=bool))):
-        try:
-            out += _figure(
-                plot_bead_gates(source, bead_key=key),
-                "the bead gate: each bead channel against DNA, gated beads in red",
-                dpi,
-            )
-        except (KeyError, ValueError):
-            pass
-    else:
-        out += (
-            '<p class="note">The bead events have been removed, so the gate itself '
-            "cannot be redrawn. Pass the pre-removal object as <code>beads=</code> "
-            "to include those panels.</p>"
-        )
-    return out
-
-
 def _gates_section(adata: ad.AnnData, plotted: ad.AnnData, dpi: int, max_gates: int) -> str:
-    from .gating import gate_stats
+    from .gating import gate_record, gate_stats
     from .plotting import plot_gate
 
     gates = adata.uns.get("cytopy", {}).get("gates", {})
@@ -307,14 +256,15 @@ def _gates_section(adata: ad.AnnData, plotted: ad.AnnData, dpi: int, max_gates: 
     if not drawable:
         return ""
     rows = []
+    records = {name: gate_record(adata, name) for name in drawable}
     for name in drawable:
-        record = gates[name]
-        stats = gate_stats(adata, name, parent=record.get("parent") or None)
+        record = records[name]
+        stats = gate_stats(adata, name, parent=record.parent or None)
         rows.append(
             {
                 "gate": name,
-                "parent": record.get("parent") or "",
-                "channels": f"{record.get('x', '')} / {record.get('y', '')}",
+                "parent": record.parent,
+                "channels": f"{record.x} / {record.y}",
                 "n": stats["n"],
                 "pct_total": stats["pct_total"],
                 "pct_parent": stats.get("pct_parent", float("nan")),
@@ -322,7 +272,7 @@ def _gates_section(adata: ad.AnnData, plotted: ad.AnnData, dpi: int, max_gates: 
         )
     out = _heading("Gates") + _table(pd.DataFrame(rows).set_index("gate"))
 
-    panels = [n for n in drawable if gates[n].get("vertices")][-max_gates:]
+    panels = [n for n in drawable if records[n].has_outline()][-max_gates:]
     for name in panels:
         try:
             ax = plot_gate(plotted, name)
@@ -337,48 +287,6 @@ def _gates_section(adata: ad.AnnData, plotted: ad.AnnData, dpi: int, max_gates: 
     return out
 
 
-def _debarcode_section(adata: ad.AnnData, dpi: int, max_barcodes: int) -> str:
-    info = adata.uns.get("cytopy", {}).get("debarcode")
-    if not info or "bc_id" not in adata.obs:
-        return ""
-    from .debarcode import barcode_stats, plot_barcode_events, plot_yields
-
-    stats = barcode_stats(adata)
-    out = _heading("Debarcoding")
-    out += (
-        f'<p class="note">{len(info["key"])} barcodes on '
-        f"{html.escape(', '.join(info['channels']))}, "
-        f"{info.get('n_positive', 0)} positive channels each"
-        + (
-            f"; Mahalanobis cutoff {info['mhl_cutoff']:g}."
-            if info.get("mhl_cutoff") is not None
-            else "."
-        )
-        + "</p>"
-    )
-    out += _table(stats)
-    ids = [i for i in stats.index if i != "0"][:max_barcodes]
-    try:
-        out += _figure(
-            plot_yields(adata, ids),
-            "yield against separation cutoff; grey bars are events, the red line the "
-            "surviving fraction, the dashed line the cutoff applied",
-            dpi,
-        )
-    except (KeyError, ValueError):
-        pass
-    try:
-        out += _figure(
-            plot_barcode_events(adata, ["0", *ids][: max_barcodes + 1]),
-            "barcode intensities of sampled events; a clean population splits into a "
-            "positive and a negative band",
-            dpi,
-        )
-    except (KeyError, ValueError):
-        pass
-    return out
-
-
 def gating_pdf(
     adata: ad.AnnData,
     path: str | os.PathLike,
@@ -388,6 +296,7 @@ def gating_pdf(
     per_page: int = 6,
     subsample: int | None = 200_000,
     dpi: int = 150,
+    seed: int = 0,
     **kwargs,
 ) -> Path:
     """Write the gating hierarchy to a PDF, one plot per gate.
@@ -415,8 +324,10 @@ def gating_pdf(
         a density.
     dpi
         Resolution of the figures.
+    seed
+        Seed for the subsample, so the same events are drawn each time.
     **kwargs
-        Passed to :func:`~cytopy.plot_biaxial`.
+        Passed to :func:`~cytopy.plot_gate`.
 
     Returns
     -------
@@ -435,18 +346,19 @@ def gating_pdf(
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
 
-    from .plotting import plot_biaxial
+    from .gating import gate_order, gate_record
+    from .plotting import plot_gate
 
     gates = adata.uns.get("cytopy", {}).get("gates", {})
-    order = _hierarchy(gates)
-    drawable = [g for g in order if gates[g].get("vertices") and g in adata.obs]
+    order = gate_order(adata)
+    drawable = [g for g in order if g in adata.obs and gate_record(adata, g).has_outline()]
     if not drawable:
         raise ValueError(
             "no gates with an outline to draw; gates applied from a mask rather "
             "than drawn record no plane"
         )
 
-    plotted = _thin(adata, subsample)
+    plotted = _thin_events(adata, subsample, seed)
     if title is None:
         title = _default_title(adata)
     rows = int(np.ceil(per_page / ncols))
@@ -461,30 +373,13 @@ def gating_pdf(
             fig, axes = plt.subplots(rows, ncols, figsize=(3.6 * ncols, 3.5 * rows), squeeze=False)
             flat = axes.ravel()
             for ax, name in zip(flat, chunk):
-                _draw_gate_page(plotted, adata, gates, name, ax, plot_biaxial, kwargs)
+                _draw_gate_page(plotted, adata, name, ax, plot_gate, kwargs)
             for ax in flat[len(chunk) :]:
                 ax.set_visible(False)
             fig.tight_layout()
             pdf.savefig(fig, dpi=dpi)
             plt.close(fig)
     return path
-
-
-def _hierarchy(gates: dict) -> list[str]:
-    """Gate names, parents before their children."""
-    order: list[str] = []
-
-    def _walk(under: str) -> None:
-        """Depth first, appending every gate nested under ``under``."""
-        for name, record in gates.items():
-            if str(record.get("parent") or "") == under:
-                order.append(name)
-                _walk(name)
-
-    _walk("")
-    # Anything whose parent is missing still deserves a page.
-    order += [g for g in gates if g not in order]
-    return order
 
 
 def _depth(gates: dict, name: str) -> int:
@@ -505,12 +400,17 @@ def _default_title(adata: ad.AnnData) -> str:
     return "gating"
 
 
-def _draw_gate_page(plotted, adata, gates, name, ax, plot_biaxial, kwargs) -> None:
-    """One gate: its parent's events, its outline, and what it kept."""
-    record = gates[name]
-    parent = str(record.get("parent") or "")
-    stored = str(record.get("layer", "X"))
-    layer = None if stored in ("X", "") else stored
+def _draw_gate_page(plotted, adata, name, ax, plot_gate, kwargs) -> None:
+    """One gate: its parent's events, its outline, and what it kept.
+
+    The figure itself is :func:`~cytopy.plot_gate`; what this adds is a title
+    naming the lineage and the share kept, counted on the *whole* object rather
+    than the thinned copy the page is drawn from.
+    """
+    from .gating import gate_record
+
+    record = gate_record(adata, name)
+    parent = record.parent
 
     n = int(adata.obs[name].sum())
     total = int(adata.obs[parent].sum()) if parent and parent in adata.obs else adata.n_obs
@@ -518,14 +418,10 @@ def _draw_gate_page(plotted, adata, gates, name, ax, plot_biaxial, kwargs) -> No
     lineage = f"{parent} > " if parent else ""
 
     try:
-        plot_biaxial(
+        plot_gate(
             plotted,
-            record["x"],
-            record["y"],
-            layer=layer,
-            subset=parent or None,
+            name,
             color_by=name if name in plotted.obs else "density",
-            gate=name,
             title=f"{lineage}{name}\n{n:,} of {total:,}  ({share:.1f}%)",
             ax=ax,
             **kwargs,
@@ -539,10 +435,11 @@ def _hierarchy_page(adata, gates, order, title):
     """A contents page: the tree, with counts and frequencies."""
     import matplotlib.pyplot as plt
 
+    from .gating import gate_record
+
     rows = []
     for name in order:
-        record = gates[name]
-        parent = str(record.get("parent") or "")
+        parent = gate_record(adata, name).parent
         n = int(adata.obs[name].sum()) if name in adata.obs else 0
         total = int(adata.obs[parent].sum()) if parent and parent in adata.obs else adata.n_obs
         rows.append(

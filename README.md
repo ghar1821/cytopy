@@ -20,18 +20,17 @@ uv pip install -e ".[gui,dev]"
 import cytopy
 
 adata = cytopy.read_fcs("sample.fcs")        # events x channels, + layers["raw"]
-cytopy.compensate(adata)                     # -> adata.layers["comp"]
+cytopy.compensate(adata, inplace=True)       # -> adata.layers["comp"]
 cytopy.asinh_transform(adata, cofactor=150,  # -> adata.layers["asinh"]
-                       layer="comp")
+                       layer="comp", inplace=True)
 
-cytopy.view(adata, layer="asinh", x="CD3", y="CD19")
+cytopy.open_napari(adata, "asinh", x="CD3", y="CD19")   # or pick them in the window
 ```
 
 or from a terminal:
 
 ```bash
 cytopy sample.fcs --compensate --asinh --cofactor 150 -x CD3 -y CD19
-cytopy run.fcs --normalise --asinh --cofactor 5        # mass cytometry
 ```
 
 ### Compensation
@@ -41,15 +40,15 @@ cytopy run.fcs --normalise --asinh --cofactor 5        # mass cytometry
 same square DataFrame indexed by detector, with `1` on the diagonal:
 
 ```python
-cytopy.compensate(adata)                       # 1. the file's own $SPILLOVER
-cytopy.compensate(adata, "matrix.csv")         # 2. exported by other software
+cytopy.compensate(adata, inplace=True)                  # 1. the file's own $SPILLOVER
+cytopy.compensate(adata, "matrix.csv", inplace=True)    # 2. exported by other software
 
 controls, unstained = cytopy.read_controls("controls/")   # 3. single-stain controls
-spill = cytopy.spillover_from_controls(controls, unstained=unstained)
-cytopy.compensate(adata, spill)
+spill = cytopy.compute_spillover_matrix(controls, unstained=unstained)
+cytopy.compensate(adata, spill, inplace=True)
 ```
 
-**From single-stain controls.** `spillover_from_controls` implements the
+**From single-stain controls.** `compute_spillover_matrix` implements the
 Bagwell and Adams matrix-inversion method. For the control stained with dye
 *i*, it takes the difference between the positive and negative populations in
 every detector *j*, then divides that row through by the difference in the
@@ -65,11 +64,11 @@ an arcsinh scale (Otsu), or you can gate it yourself:
 controls, unstained = cytopy.read_controls("controls/")
 everything = {**controls, "unstained": unstained}
 
-pooled = cytopy.gate(everything)      # ONE window, every control in it
+pooled = cytopy.open_napari(everything, "asinh")   # ONE window, every control in it
 
 gated = cytopy.subset_controls(cytopy.split_samples(pooled), "singlets")
 unstained = gated.pop("unstained")
-spill = cytopy.spillover_from_controls(gated, unstained=unstained, positive_gate="positive")
+spill = cytopy.compute_spillover_matrix(gated, unstained=unstained, positive_gate="positive")
 ```
 
 There is no special function for controls — [`cytopy.gate`](#gating) is the same
@@ -148,122 +147,9 @@ matrix. `write_spillover` writes one back out.
 From the terminal:
 
 ```bash
-cytopy sample.fcs --controls controls/ --asinh -x CD3 -y CD19
+cytopy sample.fcs --controls controls/ --asinh
 cytopy sample.fcs --spillover matrix.csv --asinh
 ```
-
-### Bead normalisation (mass cytometry)
-
-Mass cytometry sensitivity drifts over an acquisition. Spiked-in metal beads do
-not change, so their drift *is* the instrument's, and every mass channel can be
-scaled back onto a fixed baseline — Finck et al. (2013).
-
-```python
-adata = cytopy.read_fcs("run.fcs")
-
-cytopy.gate_beads(adata)                 # -> adata.obs["bead"]
-cytopy.normalise_beads(adata)            # -> adata.layers["normalised"]
-cytopy.plot_beads_over_time(adata)       # the before/after diagnostic
-```
-
-or interactively, which is the point of the **beads** panel in the viewer:
-pick a bead channel to plot it against DNA, drag a rectangle round the bead
-population, hit *gate from drawn rectangle*, then *apply bead gate* and
-*normalise*. The gate is premessa's — one rectangle per bead channel, on
-`asinh(x / 5)` — and an event is a bead only when it is inside all of them.
-The default is `x = (2, 5)`, `y = (-1, 2)`; it is a starting point, not an
-answer, which is why it is adjustable.
-
-```python
-cytopy.gate_beads(adata, gates={"Ce140Di": {"x": (2.5, 4.8)}})   # move one edge
-cytopy.gate_beads(adata, beads="beta")                           # or "fluidigm"/"dvs", "xt"
-cytopy.gate_beads(adata, beads=[140, 151, 153, 165, 175])        # or your own masses
-```
-
-Bead channels are matched by isotope against `$PnN`, so `Ce140Di`, `140Ce` and a
-bare `140` all resolve; a bead set missing a channel is an error, not a warning.
-`obs["bead"]` is read if it already exists, so a polygon drawn in the viewer or
-any other mask works in place of the rectangles. The gate you settled on is
-kept in `adata.uns["cytopy"]["beads"]["gates"]` and survives `write_h5ad`, so
-you can re-apply it to the next file: `gate_beads(other, gates=saved)`.
-
-To put several acquisitions on one scale, compute the baseline once and pass it
-in; each sample is smoothed and interpolated on its own clock, since `Time`
-restarts with every file.
-
-```python
-baseline = cytopy.bead_baseline(reference)
-cytopy.normalise_beads(adata, baseline=baseline)
-```
-
-After normalising, `cytopy.bead_distance(adata, layer="normalised")` gives
-premessa's `beadDist` — the Mahalanobis distance from the bead centroid — which
-catches the bead-cell doublets a rectangular gate lets through. `remove_beads`
-drops the beads and, given `distance_cutoff=`, those doublets too, recording
-what went in the filter log:
-
-```python
-clean = cytopy.remove_beads(adata, distance_cutoff=5, layer="normalised")
-```
-
-**Fidelity.** The arithmetic is CATALYST's `normCytof` and premessa's
-`normalize_folder`, which agree with each other: bead intensities are smoothed
-over time with a running median, the correction factor is the slope of the
-no-intercept least-squares fit `sum(b * B) / sum(b * b)`, and those slopes are
-interpolated linearly across all events. Checked against both R implementations
-run on the same data — the gate selects the identical events and the output
-agrees to 1e-12 in float64. Where the two differ, the defaults here are
-premessa's:
-
-| | premessa (default) | CATALYST |
-| --- | --- | --- |
-| baseline | median of bead events | mean (`statistic="mean"`) |
-| smoothing window | 201 events | 500 (`k=500`) |
-| running-median ends | Tukey end rule | repeat (`endrule="constant"`) |
-| doublets | `bead_distance` after | median±5·MAD (`trim=5`) |
-| gate | rectangles you adjust | automatic |
-
-### Debarcoding
-
-Samples barcoded with a combination of metal tags, pooled and acquired
-together, are separated again with CATALYST's method:
-
-```python
-cytopy.assign_prelim(adata, "pd20")   # -> obs["bc_id"], obs["delta"]
-cytopy.estimate_cutoffs(adata)        # -> uns[...]["sep_cutoffs"]
-cytopy.plot_yields(adata)             # look before you commit
-cytopy.apply_cutoffs(adata, mhl_cutoff=30)
-
-cytopy.debarcode(adata, "pd20")       # all three, when you do not want to look
-```
-
-`"pd20"` is the Fluidigm Cell-ID 20-Plex Pd kit — six palladium channels,
-three positive in each of 20 barcodes. Any other scheme works as a table or a
-mapping:
-
-```python
-cytopy.barcode_key({"donor1": [102, 104, 105], "donor2": [102, 104, 106]})
-```
-
-Within each event the barcode channels are ranked and the top *k* called
-positive, which gives a binary code to look up. Intensities are then rescaled
-per population by the 95th percentile of that population's own positive
-channels, and each event scores a **delta**: the gap between its lowest
-positive and its highest negative barcode. A confidently barcoded cell has a
-large gap; a doublet carrying two barcodes has almost none. Each population
-gets a separation cutoff estimated from where its yield curve turns over, and
-a Mahalanobis cutoff on top of that. Everything failing either is left as
-`"0"`, unassigned — and `obs["bc_prelim"]` keeps the call before the cutoffs,
-so the yield plots still show what each one discarded.
-
-**Fidelity.** Checked against CATALYST's `assignPrelim` / `estCutoffs` /
-`applyCutoffs` run verbatim in R on the same 60,000 events: the preliminary
-assignments are identical event for event, the deltas agree to 8e-16, the
-Mahalanobis distances to 9e-15, and the final assignments are identical with
-zero disagreements. Cutoff estimates are the one place they part company —
-`drc::drm` fits the log-logistic curve and scipy does not fit it identically,
-so 19 of 20 agreed to 1e-5 and one landed on the adjacent point of the 0.01
-grid the estimate is searched on. It changed no assignment.
 
 ### Reports
 
@@ -272,24 +158,21 @@ account for all of them without having kept the intermediates:
 
 ```python
 cytopy.filter_log(adata)
-#           step                                          reason  n_before  n_removed  n_after
-#   remove beads  inside the bead gate (4,109 events); 0 more...     60000       4109    55891
-#      debarcode  2,958 below their separation cutoff, 140 be...     55891       3098    52793
+#      step                                     reason  n_before  n_removed  n_after
+#    debris        outside the scatter gate (4,109 ...     60000       4109    55891
+#      dead                 7AAD positive (3,098 ...     55891       3098    52793
 ```
 
 `cytopy.report` turns that, and the plots behind it, into one self-contained
 HTML file — no assets alongside it, opens anywhere:
 
 ```python
-cytopy.report(adata, "qc.html", title="Run 1", beads=before_removal)
+cytopy.report(adata, "qc.html", title="Run 1")
 ```
 
-It picks up whatever the data carries: the event tally at each step, the bead
-before/after lines, the bead gate with the gated events picked out, every gate
-in the plane it was drawn in, and the debarcoding yield and event plots. Pass
-`beads=` the object from before the beads were removed if you want those
-panels; the line plot needs nothing, because normalisation stashes the curves
-it would need.
+It picks up whatever the data carries: the event tally at each step and every
+gate in the plane it was drawn in. Sections with nothing behind them are left
+out rather than left empty.
 
 ### Biaxial plots
 
@@ -301,8 +184,8 @@ events pile up.
 
 ```python
 cytopy.plot_biaxial(adata, "CD3", "CD19", layer="asinh")      # density
-cytopy.plot_biaxial(adata, "CD3", "CD19", color_by="bead")    # a group over a grey density
-cytopy.plot_biaxial(adata, "Ce140Di", "Ir193Di", cofactor=5)  # display-only arcsinh
+cytopy.plot_biaxial(adata, "CD3", "CD19", layer="asinh", color_by="lymphs")  # a gate over a density
+cytopy.plot_biaxial(adata, "CD3", "CD19", layer="raw", cofactor=150)        # display-only arcsinh
 cytopy.plot_gate(adata, "lymphocytes")                        # redraw a gate where it was drawn
 ```
 
@@ -312,41 +195,32 @@ display without writing a layer, which matters when the matrix is large.
 
 ### Large runs
 
-Everything on the mass cytometry path is sized for runs of millions of events.
-Measured on 5,000,000 events (a 2020 M1 laptop, single core):
+Everything is sized for runs of millions of events. What that took, in case you
+hit the same walls elsewhere:
 
-| | 12 channels | 46 channels |
-| --- | --- | --- |
-| `gate_beads` | 0.26 s, +35 MB | 0.35 s, +36 MB |
-| `normalise_beads` | 1.3 s, +64 MB | 3.1 s, +936 MB |
-| `normalise_beads(key_added=None)` | — | 2.1 s, **+44 MB** |
-| `plot_beads_over_time` | 0.32 s | — |
-| viewer redraw | 0.05 s | — |
-| dragging a bead gate edge | 0.02 s | — |
-
-The memory figures are on top of the matrix itself (0.86 GB at 46 channels).
-Writing a new layer costs one more copy of it, which is unavoidable;
-`key_added=None` normalises `adata.X` in place and costs nothing.
-
-What that took, in case you hit the same walls elsewhere:
-
-* **Never widen the matrix.** Only the bead channels at the bead events are
-  needed to fit the slopes — a few hundred thousand rows however big the file
-  is — and the output is written a column at a time at the storage dtype. An
-  intermediate `float64` copy of everything was 1.2 GB at 12 channels and over
-  4 GB at 46.
 * **Group by categorical codes, not strings.** `obs["sample"].astype(str)`
-  builds a Python string per event; that one line was 0.8 s of the 1.4 s the
-  diagnostic plot used to take.
+  builds a Python string per event; that one line was 0.8 s of the 1.4 s a
+  per-sample plot used to take.
 * **Bin by arithmetic.** `density_image` computes bin indices directly and
   counts with `bincount` rather than calling `np.histogram2d`. Identical
-  output, 6× faster, and it runs on every widget change.
-* **Draw fewer points than you compute.** `plot_beads_over_time` smooths over
-  every bead event and then thins the finished curve to `max_points` (10,000
-  by default). The line is the same; matplotlib just gets less of it.
-* **Estimate while dragging, count exactly on apply.** The bead panel's live
-  count comes from a fixed 250,000-event subsample and is labelled `est.`;
-  *apply bead gate* uses every event.
+  output, 6x faster, and it runs on every widget change.
+* **Never widen the matrix.** Intermediates are computed at the storage dtype
+  and written a column at a time; a `float64` copy of everything was over 4 GB
+  at 46 channels.
+
+### Nothing is modified unless you say so
+
+`compensate`, `asinh_transform` and `logicle_transform` return a modified copy
+by default and leave the object you passed alone. Pass `inplace=True` to build
+the layers up on one object, which is what a pipeline usually wants:
+
+```python
+cytopy.compensate(adata, spill, inplace=True)              # adata gains layers["comp"]
+comped = cytopy.compensate(adata, spill)                   # adata untouched
+```
+
+The default is the safe one on purpose: a call whose result you forget to
+assign cannot quietly change the data underneath you.
 
 ### Transforms are always explicit
 
@@ -368,10 +242,10 @@ share and become entries in the **sample** selector, so one window browses the
 lot:
 
 ```python
-cytopy.view([run1, run2, run3])                     # AnnData you already have
-cytopy.view({"healthy": run1, "treated": run2})     # name them yourself
-cytopy.view("data/")                                # every FCS in a directory
-cytopy.view(["a.fcs", "b.h5ad"])                    # paths work too
+cytopy.open_napari([run1, run2, run3], "asinh")            # AnnData you already have
+cytopy.open_napari({"healthy": run1, "treated": run2}, "asinh")  # name them yourself
+cytopy.open_napari("data/", "raw")                         # every FCS in a directory
+cytopy.open_napari(["a.fcs", "b.h5ad"], "raw")             # paths work too
 ```
 
 Two files called the same thing stay two entries (`demo`, `demo.1`) rather than
@@ -381,14 +255,14 @@ samples look alike when they are not. Turn it off to let each sample fill the
 plot.
 
 Panels need not match — the intersection of the channels is kept. `uns` comes
-from the first object, so per-file provenance (bead gates, spillover) beyond
+from the first object, so per-file provenance (spillover) beyond
 the first is not carried over; normalise and gate before combining if you need
 it kept.
 
 ### Gating
 
 ```python
-cytopy.gate(adata, layer="asinh")     # opens napari; returns when you close it
+cytopy.open_napari(adata, "asinh")   # opens napari; returns the data when you close it
 ```
 
 Gate as many times as you like in the one window: draw, apply, change the
@@ -470,11 +344,6 @@ Gate provenance (channels, layer, parent, counts) is kept in
 | `adata.layers["asinh"]` | arcsinh transformed |
 | `adata.obs["sample"]` | source file, for concatenated runs |
 | `adata.obs[<gate>]` | boolean gate membership |
-| `adata.obs["bead"]` | bead events, from the bead gate |
-| `adata.obs["bead_slope"]` | per-event bead correction factor |
-| `adata.layers["normalised"]` | bead-normalised counts |
-| `adata.obs["bc_id"]` | barcode, `"0"` for unassigned |
-| `adata.obs["delta"]` | barcode separation per event |
 | `adata.uns["cytopy"]["filters"]` | what each step removed, and why |
 | `adata.uns["fcs"]` | the raw FCS TEXT keywords |
 | `adata.uns["spillover"]` | `$SPILLOVER` as a DataFrame |
@@ -508,7 +377,6 @@ population.
 ```bash
 python examples/make_demo_fcs.py demo.fcs           # synthetic 6-channel data
 python examples/make_demo_fcs.py demo.fcs controls  # + single-stain controls
-python examples/make_demo_cytof.py demo_cytof.fcs    # synthetic CyTOF with drift
 python examples/quickstart.py demo.fcs
 pytest                                              # the viewer tests need a display
 ```

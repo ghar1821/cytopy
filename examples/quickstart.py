@@ -1,7 +1,7 @@
 """End-to-end: FCS -> AnnData -> compensate -> transform -> napari.
 
-    python examples/make_demo_fcs.py demo.fcs controls
-    python examples/quickstart.py demo.fcs controls
+python examples/make_demo_fcs.py demo.fcs controls
+python examples/quickstart.py demo.fcs controls
 """
 
 from __future__ import annotations
@@ -23,23 +23,18 @@ def main(path: str = "demo.fcs", controls: str | None = None) -> None:
         # No matrix from the instrument? Derive one from the single-stain
         # controls instead (Bagwell and Adams).
         stained, unstained = cytopy.read_controls(controls)
-        spillover = cytopy.spillover_from_controls(stained, unstained=unstained)
+        spillover = cytopy.compute_spillover_matrix(stained, unstained=unstained)
         print("spillover from controls:\n", spillover.round(4))
-    cytopy.compensate(adata, spillover)                   # -> layers["comp"]
+    cytopy.compensate(adata, spillover, inplace=True)  # -> layers["comp"]
     print("suggested cofactors:", cytopy.estimate_cofactors(adata, layer="comp"))
-    cytopy.asinh_transform(adata, 150.0, layer="comp")    # -> layers["asinh"]
+    cytopy.asinh_transform(adata, 150.0, layer="comp", inplace=True)  # -> layers["asinh"]
 
-    cv = cytopy.view(
-        adata,
-        layer="asinh",
-        x="CD3",
-        y="CD19",
-        block=True,
-    )
-    # Gates drawn in the window are boolean columns by the time this returns.
+    # Pick the channels in the window. Gates drawn there are boolean columns
+    # by the time this returns, because it blocks until you close it.
+    adata = cytopy.open_napari(adata, "asinh", block=True, verbose=True)
     for name in adata.uns.get("cytopy", {}).get("gates", {}):
         print(cytopy.gate_stats(adata, name))
-    return cv
+    return adata
 
 
 if __name__ == "__main__":

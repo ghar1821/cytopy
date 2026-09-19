@@ -20,7 +20,7 @@ def _agg():
 # biaxial plots
 # --------------------------------------------------------------------------
 def test_biaxial_is_a_density_by_default(demo):
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19")
+    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X")
     assert len(ax.images) == 1 and not ax.collections
     image = ax.images[0].get_array()
     assert image.shape == (512, 512) and image.max() > 0
@@ -30,28 +30,30 @@ def test_biaxial_is_a_density_by_default(demo):
 
 def test_biaxial_colours_by_a_boolean_column(demo):
     demo.obs["big"] = np.asarray(demo.X[:, 0]) > np.median(demo.X[:, 0])
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", color_by="big")
+    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X", color_by="big")
     assert len(ax.images) == 1 and len(ax.collections) == 1
     assert ax.images[0].get_cmap().name == "Greys"  # the highlight carries the colour
     assert ax.get_legend() is not None
     with pytest.raises(KeyError, match="to colour by"):
-        cytopy.plot_biaxial(demo, "CD3", "CD19", color_by="nope")
+        cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X", color_by="nope")
 
 
 def test_biaxial_subsets(demo):
     demo.obs["half"] = np.arange(demo.n_obs) < demo.n_obs // 2
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", subset="half")
+    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X", subset="half")
     assert "30,000 events" in ax.get_title(loc="left")
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", subset=np.zeros(demo.n_obs, dtype=bool))
+    ax = cytopy.plot_biaxial(
+        demo, "CD3", "CD19", layer="X", subset=np.zeros(demo.n_obs, dtype=bool)
+    )
     assert "0 events" in ax.get_title(loc="left")
     with pytest.raises(ValueError, match="expected 60000"):
-        cytopy.plot_biaxial(demo, "CD3", "CD19", subset=np.ones(3, dtype=bool))
+        cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X", subset=np.ones(3, dtype=bool))
 
 
 def test_biaxial_axes_read_in_raw_units(demo):
     """The viewer's rule: a layer that records its transform gets decade ticks."""
-    cytopy.asinh_transform(demo, 150.0)
-    plain = cytopy.plot_biaxial(demo, "CD3", "CD19")
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
+    plain = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X")
     labelled = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="asinh")
     assert not any(
         "¹⁰" in t.get_text() or "10" in t.get_text() for t in plain.get_xticklabels()[:1]
@@ -62,7 +64,7 @@ def test_biaxial_axes_read_in_raw_units(demo):
 
 def test_biaxial_cofactor_transforms_for_display_only(demo):
     before = np.asarray(demo.X).copy()
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", cofactor=5.0)
+    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", layer="X", cofactor=5.0)
     assert np.array_equal(np.asarray(demo.X), before)  # nothing written back
     assert "asinh" not in demo.layers
     assert ax.get_xlim()[1] < 20  # plotted on the compressed scale
@@ -70,7 +72,9 @@ def test_biaxial_cofactor_transforms_for_display_only(demo):
 
 
 def test_biaxial_draws_rectangles(demo):
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD19", rectangles=[(100.0, 500.0, 100.0, 500.0)])
+    ax = cytopy.plot_biaxial(
+        demo, "CD3", "CD19", layer="X", rectangles=[(100.0, 500.0, 100.0, 500.0)]
+    )
     dashed = [ln for ln in ax.lines if ln.get_linestyle() == "--"]
     assert len(dashed) == 1
     # The outline must not drag the axes with it.
@@ -113,7 +117,7 @@ def test_plot_gate_needs_a_recorded_gate(demo):
 
 def test_a_gate_outline_is_skipped_on_the_wrong_axes(demo):
     name = _draw_gate(demo)
-    ax = cytopy.plot_biaxial(demo, "CD3", "CD8", gate=name)
+    ax = cytopy.plot_biaxial(demo, "CD3", "CD8", layer="X", gate=name)
     assert not [ln for ln in ax.lines if ln.get_linestyle() == "--"]
 
 
@@ -157,47 +161,14 @@ def test_an_empty_log_is_an_empty_table(demo):
     assert "step" in cytopy.filter_log(demo).columns
 
 
-def test_remove_beads_records_the_gate(cytof):
-    cytopy.gate_beads(cytof)
-    n_beads = int(cytof.obs["bead"].sum())
-    clean = cytopy.remove_beads(cytof)
-    assert clean.n_obs == cytof.n_obs - n_beads
-    row = cytopy.filter_log(clean).iloc[0]
-    assert row["step"] == "remove beads" and row["n_removed"] == n_beads
-    assert f"{n_beads:,}" in row["reason"]
-
-
-def test_remove_beads_can_also_take_the_bead_adjacent(barcoded):
-    """The distance rule catches what sits next to the beads but outside the gate."""
-    mask = cytopy.gate_beads(barcoded)
-    # Let a hundred beads slip the gate, as a bead-cell doublet would.
-    slipped = np.flatnonzero(mask)[:100]
-    barcoded.obs.loc[barcoded.obs_names[slipped], "bead"] = False
-
-    plain = cytopy.remove_beads(barcoded)
-    assert plain.n_obs == barcoded.n_obs - (int(mask.sum()) - 100)
-
-    strict = cytopy.remove_beads(barcoded, distance_cutoff=10.0)
-    assert strict.n_obs == barcoded.n_obs - int(mask.sum())  # all of them, back again
-    # Two calls on the same object, so the log has an entry for each.
-    log = cytopy.filter_log(strict)
-    assert list(log["step"]) == ["remove beads", "remove beads"]
-    assert "100 more within 10 of the bead centroid" in log.iloc[-1]["reason"]
-    with pytest.raises(KeyError, match="gate_beads"):
-        cytopy.remove_beads(barcoded, bead_key="nope")
-
-
 # --------------------------------------------------------------------------
 # the report
 # --------------------------------------------------------------------------
-def test_report_is_one_self_contained_file(barcoded, tmp_path):
-    cytopy.gate_beads(barcoded)
-    cytopy.normalise_beads(barcoded)
-    gated = barcoded.copy()
-    clean = cytopy.remove_beads(barcoded, distance_cutoff=3.0, layer="normalised")
-    cytopy.debarcode(clean, "pd20", layer="normalised")
+def test_report_is_one_self_contained_file(demo, tmp_path):
+    _draw_gate(demo)
+    clean = cytopy.filter_events(demo, np.arange(demo.n_obs) < 50_000, step="debris")
 
-    path = cytopy.report(clean, tmp_path / "qc.html", title="Run 1", beads=gated, max_barcodes=3)
+    path = cytopy.report(clean, tmp_path / "qc.html", title="Run 1")
     assert path.exists() and list(tmp_path.iterdir()) == [path]
     text = path.read_text()
     assert text.startswith("<!doctype html>")
@@ -205,14 +176,13 @@ def test_report_is_one_self_contained_file(barcoded, tmp_path):
     assert re.findall(r"<h2>(.*?)</h2>", text) == [
         "Summary",
         "What was removed",
-        "Bead normalisation",
-        "Debarcoding",
+        "Gates",
     ]
     # Every figure is inlined, so there is nothing to lose alongside the file.
-    assert len(re.findall(r"data:image/png;base64,", text)) >= 4
+    assert len(re.findall(r"data:image/png;base64,", text)) >= 2
     assert 'src="http' not in text and "<link" not in text
     # The filter log is in there as numbers, not just pictures.
-    assert "remove beads" in text and "debarcode" in text
+    assert "debris" in text and "50,000" in text
 
 
 def test_report_skips_sections_with_nothing_to_show(demo, tmp_path):
@@ -221,35 +191,12 @@ def test_report_skips_sections_with_nothing_to_show(demo, tmp_path):
     assert "60,000 events" in text
 
 
-def test_report_sections_can_be_chosen(cytof, tmp_path):
-    cytopy.gate_beads(cytof)
-    cytopy.normalise_beads(cytof)
-    text = cytopy.report(cytof, tmp_path / "beads.html", sections=["beads"]).read_text()
-    assert re.findall(r"<h2>(.*?)</h2>", text) == ["Bead normalisation"]
+def test_report_sections_can_be_chosen(demo, tmp_path):
+    _draw_gate(demo)
+    text = cytopy.report(demo, tmp_path / "gates.html", sections=["gates"]).read_text()
+    assert re.findall(r"<h2>(.*?)</h2>", text) == ["Gates"]
     with pytest.raises(ValueError, match="unknown report section"):
-        cytopy.report(cytof, tmp_path / "x.html", sections=["nope"])
-
-
-def test_the_bead_figure_survives_the_beads_being_removed(cytof, tmp_path):
-    """The curves are stashed at normalisation, so the report still has them."""
-    cytopy.gate_beads(cytof)
-    cytopy.normalise_beads(cytof)
-    clean = cytopy.remove_beads(cytof)
-    assert not clean.obs["bead"].any()
-
-    fig = cytopy.plot_beads_over_time(clean)
-    assert [ax.get_title(loc="left") for ax in fig.axes] == ["before", "after"]
-    text = cytopy.report(clean, tmp_path / "qc.html", sections=["beads"]).read_text()
-    assert "data:image/png;base64," in text
-    assert "cannot be redrawn" in text  # honest about the gate panels it cannot draw
-
-
-def test_without_stashed_curves_the_figure_is_refused(cytof):
-    cytopy.gate_beads(cytof)
-    cytopy.normalise_beads(cytof, stash_curves=None)
-    clean = cytopy.remove_beads(cytof)
-    with pytest.raises(KeyError, match="no stashed curves"):
-        cytopy.plot_beads_over_time(clean)
+        cytopy.report(demo, tmp_path / "x.html", sections=["nope"])
 
 
 def test_report_shows_gates(demo, tmp_path):
@@ -260,14 +207,12 @@ def test_report_shows_gates(demo, tmp_path):
     assert "data:image/png;base64," in text
 
 
-def test_everything_survives_write_h5ad(barcoded, tmp_path):
+def test_everything_survives_write_h5ad(demo, tmp_path):
     """A whole processed run has to save and come back -- log, gates and all."""
     import anndata
 
-    cytopy.gate_beads(barcoded)
-    cytopy.normalise_beads(barcoded)
-    clean = cytopy.remove_beads(barcoded, distance_cutoff=5.0, layer="normalised")
-    cytopy.debarcode(clean, "pd20", layer="normalised")
+    name = _draw_gate(demo)
+    clean = cytopy.filter_events(demo, np.arange(demo.n_obs) < 50_000, step="debris")
 
     path = tmp_path / "run.h5ad"
     clean.write_h5ad(path)
@@ -275,30 +220,28 @@ def test_everything_survives_write_h5ad(barcoded, tmp_path):
 
     assert back.n_obs == clean.n_obs
     pd.testing.assert_frame_equal(cytopy.filter_log(back), cytopy.filter_log(clean))
-    assert list(back.obs["bc_id"]) == list(clean.obs["bc_id"])
-    assert back.uns["cytopy"]["beads"]["baseline"] == clean.uns["cytopy"]["beads"]["baseline"]
+    assert list(back.obs[name]) == list(clean.obs[name])
+    record = back.uns["cytopy"]["gates"][name]
+    assert record["x"] == "CD3 (FITC-A)" and record["y"] == "CD19 (PE-A)"
     # uns lists come back as arrays, hence the list() on both sides.
-    assert list(back.uns["cytopy"]["debarcode"]["channels"]) == list(
-        clean.uns["cytopy"]["debarcode"]["channels"]
-    )
+    assert np.asarray(record["vertices"]).shape == (1, 4, 2)
 
     # The restored object is enough to write the report from.
-    text = cytopy.report(back, tmp_path / "qc.html", max_barcodes=2).read_text()
-    assert "remove beads" in text and "Debarcoding" in text
+    text = cytopy.report(back, tmp_path / "qc.html").read_text()
+    assert "debris" in text and "Gates" in text
 
 
-def test_the_log_keeps_appending_after_a_round_trip(barcoded, tmp_path):
+def test_the_log_keeps_appending_after_a_round_trip(demo, tmp_path):
     import anndata
 
-    cytopy.gate_beads(barcoded)
-    first = cytopy.remove_beads(barcoded)
+    first = cytopy.filter_events(demo, np.arange(demo.n_obs) < 40_000, step="debris")
     first.write_h5ad(tmp_path / "one.h5ad")
 
     back = anndata.read_h5ad(tmp_path / "one.h5ad")
     second = cytopy.filter_events(back, np.arange(back.n_obs) < 1000, step="later")
     log = cytopy.filter_log(second)
-    assert list(log["step"]) == ["remove beads", "later"]
-    assert list(log["n_after"]) == [first.n_obs, 1000]
+    assert list(log["step"]) == ["debris", "later"]
+    assert list(log["n_after"]) == [40_000, 1000]
 
 
 # --------------------------------------------------------------------------
@@ -308,7 +251,7 @@ def _hierarchy(adata):
     """Three nested gates, the last drawn on a different pair of channels."""
     import cytopy
 
-    cytopy.asinh_transform(adata, 150.0)
+    cytopy.asinh_transform(adata, 150.0, layer="X", inplace=True)
     values = np.asarray(adata.layers["asinh"])
 
     def gate(name, x, y, box, parent=None):
@@ -353,24 +296,20 @@ def test_gating_pdf_writes_a_page_per_gate(demo, tmp_path):
 
 
 def test_the_hierarchy_comes_out_parents_first(demo):
-    from cytopy.report import _hierarchy as order_of
-
     _hierarchy(demo)
-    gates = demo.uns["cytopy"]["gates"]
-    assert order_of(gates) == ["lymphocytes", "T cells", "CD8+"]
+    assert cytopy.gate_order(demo) == ["lymphocytes", "T cells", "CD8+"]
 
 
 def test_each_gate_is_drawn_on_the_plane_it_was_drawn_in(demo):
     import matplotlib.pyplot as plt
 
-    from cytopy.plotting import plot_biaxial
+    from cytopy.plotting import plot_gate
     from cytopy.report import _draw_gate_page
 
     _hierarchy(demo)
-    gates = demo.uns["cytopy"]["gates"]
     _, axes = plt.subplots(1, 3)
     for ax, name in zip(axes, ["lymphocytes", "T cells", "CD8+"]):
-        _draw_gate_page(demo, demo, gates, name, ax, plot_biaxial, {})
+        _draw_gate_page(demo, demo, name, ax, plot_gate, {})
 
     # the last gate was drawn on a different pair, and follows it
     assert axes[0].get_xlabel() == "CD3 (FITC-A)"
@@ -385,12 +324,11 @@ def test_each_gate_is_drawn_on_the_plane_it_was_drawn_in(demo):
 
 
 def test_the_contents_page_lists_the_tree(demo):
-    from cytopy.report import _hierarchy as order_of
     from cytopy.report import _hierarchy_page
 
     _hierarchy(demo)
     gates = demo.uns["cytopy"]["gates"]
-    fig = _hierarchy_page(demo, gates, order_of(gates), "run 1")
+    fig = _hierarchy_page(demo, gates, cytopy.gate_order(demo), "run 1")
     text = [t.get_text() for t in fig.axes[0].texts]
     assert "run 1" in text
     assert any("60,000 events" in t for t in text)
@@ -413,7 +351,7 @@ def test_gating_pdf_needs_something_to_draw(demo, tmp_path):
 def test_plot_compensation_lays_out_a_control_grid(controls):
     """A row per control, a column per detector, with the level to match marked."""
     stained, unstained = controls
-    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    spill = cytopy.compute_spillover_matrix(stained, unstained=unstained, statistic="mean")
     fig = cytopy.plot_compensation(stained, spill, unstained=unstained, max_events=5_000)
 
     n = len(stained)
@@ -430,7 +368,7 @@ def test_plot_compensation_lays_out_a_control_grid(controls):
 
 def test_over_compensation_pulls_the_population_below_the_line(controls):
     stained, unstained = controls
-    spill = cytopy.spillover_from_controls(stained, unstained=unstained, statistic="mean")
+    spill = cytopy.compute_spillover_matrix(stained, unstained=unstained, statistic="mean")
     bad = spill.copy()
     bad.loc["CD3 (FITC-A)", "CD19 (PE-A)"] = 0.30
 

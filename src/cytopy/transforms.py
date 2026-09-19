@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping, Sequence
 
 import anndata as ad
 import numpy as np
-import pandas as pd
 
+from ._util import layer_matrix, subsample_indices
 from .scales import LogicleScale
 
 __all__ = [
     "asinh_transform",
     "channel_index",
-    "compensate",
     "estimate_cofactors",
     "fluor_channels",
     "logicle_transform",
@@ -89,113 +87,7 @@ def _resolve_channels(adata: ad.AnnData, channels: Sequence[str] | None) -> list
 
 
 def _get_matrix(adata: ad.AnnData, layer: str | None) -> np.ndarray:
-    X = adata.X if layer is None else adata.layers[layer]
-    return np.asarray(X, dtype=np.float64)
-
-
-# --------------------------------------------------------------------------
-# compensation
-# --------------------------------------------------------------------------
-def compensate(
-    adata: ad.AnnData,
-    spillover: pd.DataFrame | np.ndarray | str | os.PathLike | None = None,
-    *,
-    layer: str | None = None,
-    key_added: str = "comp",
-    copy: bool = False,
-) -> ad.AnnData:
-    """Apply the spillover matrix, undoing fluorescence crosstalk between detectors.
-
-    Compensated values are ``X @ inv(S)``.
-
-    Parameters
-    ----------
-    adata
-        Cytometry AnnData.
-    spillover
-        Square spillover matrix, in any of the forms cytopy can get one:
-
-        * ``None`` (default) uses ``adata.uns['spillover']``, which
-          :func:`~cytopy.read_fcs` parses from the file's ``$SPILLOVER``;
-        * a DataFrame, whose index/columns name the detectors and need only
-          cover a subset of the channels — as returned by
-          :func:`~cytopy.spillover_from_controls`, which derives one from
-          single-stain controls;
-        * a path to a CSV exported by other software, read with
-          :func:`~cytopy.read_spillover`;
-        * a bare array, assumed to be in :func:`fluor_channels` order.
-    layer
-        Input layer. ``None`` uses ``adata.X``.
-    key_added
-        Layer to write the compensated matrix to.
-    copy
-        Return a modified copy instead of writing to ``adata`` in place.
-
-    Returns
-    -------
-    AnnData
-        The annotated object, with the compensated matrix in
-        ``adata.layers[key_added]`` and where the matrix came from in
-        ``adata.uns['cytopy']['spillover_source']``. Channels absent from the
-        matrix are copied through untouched.
-
-    Raises
-    ------
-    ValueError
-        If no matrix is given and the file recorded none, if the matrix is not
-        square, if its rows and columns do not name the same detectors, or if
-        it cannot be inverted.
-    """
-    adata = adata.copy() if copy else adata
-    source = "argument"
-    if spillover is None:
-        spillover = adata.uns.get("spillover")
-        source = "uns"
-    if spillover is None:
-        raise ValueError("no spillover matrix given and none found in adata.uns['spillover']")
-    if isinstance(spillover, str | os.PathLike):
-        from .spillover import read_spillover
-
-        source = f"csv:{spillover}"
-        spillover = read_spillover(spillover)
-    if not isinstance(spillover, pd.DataFrame):
-        names = fluor_channels(adata)
-        values = np.asarray(spillover, dtype=float)
-        if values.ndim != 2 or values.shape[0] != values.shape[1]:
-            raise ValueError(f"spillover must be a square matrix, got shape {values.shape}")
-        if values.shape[0] != len(names):
-            raise ValueError(
-                f"spillover is {values.shape[0]}x{values.shape[1]} but there are "
-                f"{len(names)} fluorescence channels; pass a DataFrame to name them"
-            )
-        spillover = pd.DataFrame(values, index=names, columns=names)
-    if spillover.shape[0] != spillover.shape[1]:
-        raise ValueError(f"spillover must be square, got shape {spillover.shape}")
-
-    # Rows and columns must describe the same detectors, but need not list them
-    # in the same order (or under the same alias), so resolve both and align.
-    cols = [channel_index(adata, c) for c in spillover.columns]
-    rows = [channel_index(adata, r) for r in spillover.index]
-    if sorted(rows) != sorted(cols):
-        raise ValueError(
-            f"spillover rows {list(spillover.index)} and columns {list(spillover.columns)} "
-            "do not name the same detectors"
-        )
-    if rows != cols:
-        spillover = spillover.iloc[[rows.index(c) for c in cols]]
-
-    X = _get_matrix(adata, layer)
-    out = X.copy()
-    try:
-        inv = np.linalg.inv(spillover.to_numpy(dtype=float))
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"spillover matrix is singular and cannot be inverted: {exc}") from exc
-    out[:, cols] = X[:, cols] @ inv
-    adata.layers[key_added] = out.astype(adata.X.dtype, copy=False)
-    cytopy_uns = adata.uns.setdefault("cytopy", {})
-    cytopy_uns["compensated_layer"] = key_added
-    cytopy_uns["spillover_source"] = source
-    return adata
+    return np.asarray(layer_matrix(adata, layer), dtype=np.float64)
 
 
 # --------------------------------------------------------------------------
@@ -205,10 +97,10 @@ def asinh_transform(
     adata: ad.AnnData,
     cofactor: float | Mapping[str, float] = 150.0,
     *,
+    layer: str,
     channels: Sequence[str] | None = None,
-    layer: str | None = None,
     key_added: str | None = "asinh",
-    copy: bool = False,
+    inplace: bool = False,
 ) -> ad.AnnData:
     """Arcsinh-transform channels: ``asinh(x / cofactor)``.
 
@@ -225,12 +117,16 @@ def asinh_transform(
         Channels to transform. Defaults to the fluorescence channels; scatter
         and time channels are copied through unchanged.
     layer
-        Input layer. ``None`` uses ``adata.X``. Pass ``"comp"`` to transform
-        compensated data.
+        Input layer to read from, by name. ``"raw"`` is what
+        :func:`~cytopy.read_fcs` stores untouched; ``"X"`` is the working
+        matrix, and ``"comp"`` the compensated one. Required, so a call
+        always says which matrix it transformed.
     key_added
         Layer to write. ``None`` overwrites ``adata.X`` instead.
-    copy
-        Return a modified copy instead of writing to ``adata`` in place.
+    inplace
+        Modify ``adata`` and return it. The default is ``False``: the original
+        is left alone and a modified copy is returned, so a call that is not
+        assigned to anything cannot quietly change the data underneath you.
 
     Returns
     -------
@@ -240,7 +136,7 @@ def asinh_transform(
         ``adata.var['cofactor']`` (``NaN`` for untransformed channels). The
         viewer reads both back to label its axes in raw units.
     """
-    adata = adata.copy() if copy else adata
+    adata = adata if inplace else adata.copy()
     idx = _resolve_channels(adata, channels)
 
     if isinstance(cofactor, Mapping):
@@ -283,8 +179,8 @@ def asinh_transform(
 def estimate_cofactors(
     adata: ad.AnnData,
     *,
+    layer: str,
     channels: Sequence[str] | None = None,
-    layer: str | None = None,
     quantile: float = 0.05,
     minimum: float = 1.0,
 ) -> dict[str, float]:
@@ -301,8 +197,9 @@ def estimate_cofactors(
     channels
         Channels to estimate for. Defaults to :func:`fluor_channels`.
     layer
-        Input layer. ``None`` uses ``adata.X``; pass ``"comp"`` to estimate
-        from compensated data, which is usually what you want.
+        Input layer to read from, by name. Usually ``"comp"``, since cofactors
+        are best estimated from compensated data. Required, so a call always
+        says which matrix it measured.
     quantile
         Quantile of the negative values to take as the noise width. Larger
         values give larger cofactors and a wider linear region.
@@ -337,14 +234,14 @@ def estimate_cofactors(
 def logicle_transform(
     adata: ad.AnnData,
     *,
+    layer: str,
     channels: Sequence[str] | None = None,
-    layer: str | None = None,
     key_added: str | None = "logicle",
     T: float | None = None,
     M: float = 4.5,
     W: float | None = None,
     A: float = 0.0,
-    copy: bool = False,
+    inplace: bool = False,
 ) -> ad.AnnData:
     """Logicle (biexponential) transform, per channel, onto a 0..1 display scale.
 
@@ -356,8 +253,10 @@ def logicle_transform(
         Channels to transform. Defaults to :func:`fluor_channels`; scatter and
         time channels are copied through unchanged.
     layer
-        Input layer. ``None`` uses ``adata.X``. Pass ``"comp"`` to transform
-        compensated data.
+        Input layer to read from, by name. ``"raw"`` is what
+        :func:`~cytopy.read_fcs` stores untouched; ``"X"`` is the working
+        matrix, and ``"comp"`` the compensated one. Required, so a call
+        always says which matrix it transformed.
     key_added
         Layer to write. ``None`` overwrites ``adata.X`` instead.
     T
@@ -371,8 +270,10 @@ def logicle_transform(
         :meth:`~cytopy.scales.LogicleScale.from_data`.
     A
         Additional decades of negative data shown below zero.
-    copy
-        Return a modified copy instead of writing to ``adata`` in place.
+    inplace
+        Modify ``adata`` and return it. The default is ``False``: the original
+        is left alone and a modified copy is returned, so a call that is not
+        assigned to anything cannot quietly change the data underneath you.
 
     Returns
     -------
@@ -382,7 +283,7 @@ def logicle_transform(
         in ``adata.uns['cytopy']['logicle_params']``, which the viewer reads
         back to label its axes in raw units.
     """
-    adata = adata.copy() if copy else adata
+    adata = adata if inplace else adata.copy()
     idx = _resolve_channels(adata, channels)
     X = _get_matrix(adata, layer)
     out = X.copy()
@@ -450,9 +351,9 @@ def subsample(
         keep: list[np.ndarray] = []
         for rows in adata.obs.groupby("sample", observed=True).indices.values():
             rows = np.asarray(rows)
-            take = rows if rows.size <= n else rng.choice(rows, n, replace=False)
-            keep.append(take)
+            take = subsample_indices(rows, n, rng=rng)
+            keep.append(rows if take is None else take)
         sel = np.sort(np.concatenate(keep))
     else:
-        sel = np.sort(rng.choice(adata.n_obs, n, replace=False))
+        sel = subsample_indices(adata.n_obs, n, rng=rng)
     return adata[sel].copy()

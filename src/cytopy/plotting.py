@@ -17,18 +17,22 @@ from collections.abc import Sequence
 import anndata as ad
 import numpy as np
 
+from ._util import LAYER_X, layer_matrix, subsample_indices
 from .density import Axes2D, density_image
-from .scales import AsinhScale, LinearScale, LogicleScale, PretransformedScale, Scale
+from .scales import (
+    AsinhScale,
+    LinearScale,
+    LogicleScale,
+    PretransformedScale,
+    Scale,
+    pad_range,
+)
 from .transforms import channel_index
 
 __all__ = ["plot_biaxial", "plot_compensation", "plot_gate"]
 
 #: Events drawn when a plot colours points individually rather than by density.
 MAX_SCATTER = 50_000
-
-
-def _matrix(adata: ad.AnnData, layer: str | None):
-    return adata.X if layer is None else adata.layers[layer]
 
 
 def axis_scale(adata: ad.AnnData, channel: str, layer: str | None) -> Scale:
@@ -45,7 +49,9 @@ def axis_scale(adata: ad.AnnData, channel: str, layer: str | None) -> Scale:
     channel
         Channel on the axis.
     layer
-        Layer being plotted, ``None`` for ``adata.X``.
+        Layer being plotted. ``None``, ``""`` and ``"X"`` all mean
+        ``adata.X``, which carries no record of a transform and so is
+        labelled with the values as stored.
 
     Returns
     -------
@@ -53,7 +59,7 @@ def axis_scale(adata: ad.AnnData, channel: str, layer: str | None) -> Scale:
         Maps plotted values to themselves; its inner transform, when it has
         one, places the raw-unit ticks.
     """
-    if layer is None:
+    if layer in (None, "", LAYER_X):
         return LinearScale()
     info = adata.uns.get("cytopy", {})
     j = channel_index(adata, channel)
@@ -65,7 +71,6 @@ def axis_scale(adata: ad.AnnData, channel: str, layer: str | None) -> Scale:
     params = info.get("logicle_layers", {}).get(layer, {}).get(name)
     if params is not None:
         return PretransformedScale(LogicleScale(**dict(params)))
-    j = channel_index(adata, channel)
     if layer == info.get("asinh_layer") and "cofactor" in adata.var:
         cofactor = float(adata.var["cofactor"].iloc[j])
         if np.isfinite(cofactor):
@@ -90,7 +95,7 @@ def plot_biaxial(
     x: str,
     y: str,
     *,
-    layer: str | None = None,
+    layer: str,
     cofactor: float | None = None,
     color_by: str = "density",
     subset: np.ndarray | str | None = None,
@@ -104,6 +109,7 @@ def plot_biaxial(
     xlim: tuple[float, float] | None = None,
     ylim: tuple[float, float] | None = None,
     title: str | None = None,
+    seed: int = 0,
     ax=None,
 ):
     """A two-channel plot, coloured by event density.
@@ -116,7 +122,9 @@ def plot_biaxial(
         Channels for the two axes. Any alias :func:`~cytopy.channel_index`
         accepts.
     layer
-        Matrix to plot, ``None`` for ``adata.X``. Values are plotted as stored;
+        Matrix to plot, by name -- ``"raw"``, ``"comp"``, ``"asinh"``, or
+        ``"X"`` for the working matrix. Required: a plot should say which
+        matrix it is of. Values are plotted as stored;
         the axes are labelled in raw units when the layer records its
         transform, exactly as in the viewer.
     cofactor
@@ -160,6 +168,9 @@ def plot_biaxial(
         :func:`plot_compensation`.
     title
         Axes title. Defaults to the event count.
+    seed
+        Seed for thinning a highlighted population down to ``MAX_SCATTER``
+        points, so the same events are drawn each time.
     ax
         Existing axes to draw on; one is created when omitted.
 
@@ -178,7 +189,7 @@ def plot_biaxial(
     if ax is None:
         _, ax = plt.subplots(figsize=(4.2, 4.0))
 
-    matrix = _matrix(adata, layer)
+    matrix = layer_matrix(adata, layer)
     xi, yi = channel_index(adata, x), channel_index(adata, y)
     x_name, y_name = str(adata.var_names[xi]), str(adata.var_names[yi])
 
@@ -235,8 +246,8 @@ def plot_biaxial(
     )
     if highlight is not None:
         hx, hy = xv[highlight], yv[highlight]
-        if hx.size > MAX_SCATTER:
-            take = np.random.default_rng(0).choice(hx.size, MAX_SCATTER, replace=False)
+        take = subsample_indices(hx.size, MAX_SCATTER, rng=np.random.default_rng(seed))
+        if take is not None:
             hx, hy = hx[take], hy[take]
         ax.scatter(hx, hy, s=1, c="#d62728", linewidths=0, alpha=0.5, label=color_by)
         ax.legend(loc="upper right", fontsize=7, frameon=False, markerscale=6)
@@ -284,22 +295,20 @@ def _gate_names(gate) -> list[str]:
 
 def _draw_gate(ax, adata: ad.AnnData, name: str, x_name: str, y_name: str) -> None:
     """Outline a recorded gate, if it was drawn on these two channels."""
-    record = adata.uns.get("cytopy", {}).get("gates", {}).get(name)
-    if record is None:
+    from .gating import gate_record
+
+    if name not in adata.uns.get("cytopy", {}).get("gates", {}):
         return
-    if str(record.get("x", "")) != x_name or str(record.get("y", "")) != y_name:
+    record = gate_record(adata, name)
+    if record.x != x_name or record.y != y_name:
         return
-    vertices = record.get("vertices")
-    if vertices is None:
-        return
-    for shape in vertices:
-        shape = np.asarray(shape, dtype=float)
+    for shape in record.vertices:
         if shape.shape[0] < 2:
             continue
         closed = np.vstack([shape, shape[:1]])
         ax.plot(closed[:, 0], closed[:, 1], color="#1f77b4", lw=1.2, ls="--")
     ax.annotate(
-        f"{name}: {int(record.get('n', 0)):,}",
+        f"{name}: {record.n:,}",
         xy=(0.02, 0.02),
         xycoords="axes fraction",
         fontsize=7,
@@ -337,19 +346,17 @@ def plot_gate(adata: ad.AnnData, name: str, *, layer: str | None = None, ax=None
     KeyError
         If the gate was never recorded, or did not record its channels.
     """
-    gates = adata.uns.get("cytopy", {}).get("gates", {})
-    if name not in gates:
-        raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
-    record = gates[name]
-    if "x" not in record or "y" not in record:
+    from .gating import gate_record
+
+    record = gate_record(adata, name)
+    if not record.x or not record.y:
         raise KeyError(f"gate {name!r} did not record which channels it was drawn on")
     if layer is None:
-        stored = str(record.get("layer", "X"))
-        layer = None if stored in ("X", "") else stored
+        layer = record.layer
     kwargs.setdefault("color_by", name)
-    kwargs.setdefault("subset", record.get("parent") or None)
-    kwargs.setdefault("title", f"{name} ({int(record.get('n', 0)):,} events)")
-    return plot_biaxial(adata, record["x"], record["y"], layer=layer, gate=name, ax=ax, **kwargs)
+    kwargs.setdefault("subset", record.parent or None)
+    kwargs.setdefault("title", f"{name} ({record.n:,} events)")
+    return plot_biaxial(adata, record.x, record.y, layer=layer, gate=name, ax=ax, **kwargs)
 
 
 def plot_compensation(
@@ -361,6 +368,7 @@ def plot_compensation(
     positive_gate: str | None = None,
     bins: int = 256,
     max_events: int | None = 100_000,
+    seed: int = 0,
     **kwargs,
 ):
     """Each single-stain control after compensation, one panel per detector.
@@ -393,6 +401,8 @@ def plot_compensation(
     max_events
         Events drawn per panel. ``None`` draws all of them; either way, axis
         ranges are always taken from every event, not just the ones drawn.
+    seed
+        Seed for that per-panel draw, so the same events are plotted each time.
     **kwargs
         Passed to :func:`plot_biaxial`. ``xlim``/``ylim`` are already set by
         this function -- to the row's own full range on x, and on y to the
@@ -411,29 +421,33 @@ def plot_compensation(
     """
     import matplotlib.pyplot as plt
 
-    from .spillover import compensate_controls
+    from .spillover import _as_anndata, compensate
 
     if not controls:
         raise ValueError("no controls to plot")
-    compensated = compensate_controls(controls, spillover, key_added="_comp")
+    compensated = {key: _as_anndata(value) for key, value in controls.items()}
+    for control in compensated.values():
+        compensate(control, spillover, key_added="_comp", inplace=True)
     if unstained is not None:
-        from .transforms import compensate
-
-        unstained = compensate(unstained, spillover, key_added="_comp", copy=True)
+        unstained = compensate(unstained, spillover, key_added="_comp")
     names = list(compensated)
-    detectors = [
-        str(next(iter(compensated.values())).var_names[channel_index(a, c)])
-        for a, c in [(next(iter(compensated.values())), n) for n in names]
+    first = next(iter(compensated.values()))
+    detectors = [str(first.var_names[channel_index(first, name)]) for name in names]
+    stained = [
+        str(compensated[dye].var_names[channel_index(compensated[dye], dye)]) for dye in names
     ]
-    stained = [str(compensated[dye].var_names[channel_index(compensated[dye], dye)]) for dye in names]
 
     # One axis range per row and per column, from every event rather than a
     # percentile, so a plot never lies about how far a population spreads --
     # and shared across a column so the same detector means the same thing
     # from row to row instead of each panel silently rescaling itself.
-    row_xlim = [_channel_range(compensated[dye], stained[row], cofactor) for row, dye in enumerate(names)]
+    row_xlim = [
+        _channel_range(compensated[dye], stained[row], cofactor) for row, dye in enumerate(names)
+    ]
     col_ylim = [
-        _merge_ranges(_channel_range(compensated[dye], detector, cofactor, pad=False) for dye in names)
+        _merge_ranges(
+            _channel_range(compensated[dye], detector, cofactor, pad=False) for dye in names
+        )
         for detector in detectors
     ]
 
@@ -445,7 +459,7 @@ def plot_compensation(
     )
     for row, dye in enumerate(names):
         adata = compensated[dye]
-        positive = _positive_events(adata, stained[row], positive_gate)
+        positive = _above_median(adata, stained[row], positive_gate)
         for col, detector in enumerate(detectors):
             ax = axes[row][col]
             plot_biaxial(
@@ -455,7 +469,7 @@ def plot_compensation(
                 layer="_comp",
                 cofactor=cofactor,
                 bins=bins,
-                subset=_sample_of(adata, max_events),
+                subset=_sample_of(adata, max_events, seed),
                 xlim=row_xlim[row],
                 ylim=col_ylim[col],
                 title=f"{dye.split(' (')[0]} → {detector.split(' (')[0]}"
@@ -473,19 +487,12 @@ def plot_compensation(
     return fig
 
 
-def _positive_events(adata, stained: str, positive_gate: str | None) -> np.ndarray:
+def _above_median(adata, stained: str, positive_gate: str | None) -> np.ndarray:
     """Which events are the stained population, for placing the reference line."""
     if positive_gate and positive_gate in adata.obs:
         return np.asarray(adata.obs[positive_gate], dtype=bool)
     column = np.asarray(adata.layers["_comp"][:, channel_index(adata, stained)], dtype=np.float64)
     return column > np.median(column)
-
-
-def _pad_range(lo: float, hi: float) -> tuple[float, float]:
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        lo, hi = lo - 0.5, lo + 0.5
-    pad = 0.02 * (hi - lo)
-    return lo - pad, hi + pad
 
 
 def _channel_range(
@@ -500,26 +507,28 @@ def _channel_range(
     values = np.asarray(
         adata.layers["_comp"][:, channel_index(adata, channel)], dtype=np.float64
     ).ravel()
-    values = np.arcsinh(values / cofactor) if cofactor is not None else axis_scale(
-        adata, channel, "_comp"
-    ).forward(values)
+    values = (
+        np.arcsinh(values / cofactor)
+        if cofactor is not None
+        else axis_scale(adata, channel, "_comp").forward(values)
+    )
     values = values[np.isfinite(values)]
     if values.size == 0:
         return (0.0, 1.0)
     lo, hi = float(values.min()), float(values.max())
-    return _pad_range(lo, hi) if pad else (lo, hi)
+    return pad_range(lo, hi) if pad else (lo, hi)
 
 
 def _merge_ranges(ranges) -> tuple[float, float]:
     """Combine several unpadded ``(lo, hi)`` spans into one, padded once."""
     los, his = zip(*ranges)
-    return _pad_range(min(los), max(his))
+    return pad_range(min(los), max(his))
 
 
-def _sample_of(adata, max_events: int | None):
-    if max_events is None or adata.n_obs <= max_events:
+def _sample_of(adata, max_events: int | None, seed: int = 0):
+    take = subsample_indices(adata.n_obs, max_events, rng=np.random.default_rng(seed))
+    if take is None:
         return None
-    take = np.random.default_rng(0).choice(adata.n_obs, max_events, replace=False)
     mask = np.zeros(adata.n_obs, dtype=bool)
     mask[take] = True
     return mask

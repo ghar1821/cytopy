@@ -13,28 +13,27 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 
-from .beads import (
-    BEAD_COFACTOR,
-    BEAD_PANELS,
-    bead_channels,
-    bead_gates,
-    dna_channel,
-    gate_beads,
-    mass_channels,
-    normalise_beads,
-)
 from .density import Axes2D, density_curve, density_image
-from .gating import add_gate, gate_children, recompute_gates, shapes_mask
-from .scales import AsinhScale, LinearScale, LogicleScale, PretransformedScale, Scale
-from .transforms import asinh_transform, channel_index
+from .gating import add_gate, gate_children, gate_record, recompute_gates, shapes_mask
+from .plotting import axis_scale
+from .scales import LinearScale, Scale
+from .transforms import channel_index
 
-__all__ = ["CytoViewer", "view"]
+__all__ = [
+    "CytoViewer",
+    "Panel",
+    "as_one_anndata",
+    "current_viewer",
+    "faded_colormap",
+    "open_napari",
+]
 
 TICK_CHOICES = ["auto", "linear"]
 COLORMAPS = ["turbo", "viridis", "magma", "inferno", "gray", "plasma"]
@@ -52,13 +51,11 @@ _FADE = 0.02
 _TEXT_STYLE = {"size": 12, "anchor": "center"}
 
 _PANEL = "panel"
-_COMPARE = "density (compare)"
 _YLABEL = "y axis label"
 _GRID = "axes"
 _LABELS = "axis labels"
 _GATES = "gates"
 _APPLIED = "applied gates"
-_BEAD_GATE = "bead gate"
 
 #: What the canvas draws. ``"density"`` is the two-channel plot;
 #: ``"histogram"`` is one smoothed distribution of the x channel per sample.
@@ -87,33 +84,8 @@ CURVE_COLOURS = [
     "#72b7b2",
 ]
 
+
 #: How the comparison panel is shown against the main one.
-COMPARE_MODES = ["side by side", "overlay"]
-_OFF = "<off>"
-
-#: Comparison against another pair of channels rather than another population.
-#: The one that makes a second plot out of a single file.
-_CHANNELS = "another channel pair"
-
-#: Colormaps for the two densities in overlay mode. Single-hue on purpose:
-#: additive blending only reads as "one, the other, or both" when each side
-#: has a hue of its own, which a multi-hue map like turbo cannot give it. The
-#: **colormap** setting governs the single-panel and side-by-side views.
-OVERLAY_COLORMAPS = ("green", "magenta")
-
-#: Gap between panels, and the colour bar's width, as fractions of ``bins``.
-_PANEL_GAP = 0.12
-_BAR_WIDTH = 0.035
-
-#: Layer the bead panel plots: arcsinh with the mass cytometry cofactor, which
-#: is the space premessa's bead gates are defined in.
-BEAD_LAYER = "beadscale"
-
-#: Events the bead panel estimates its live count from while a gate is being
-#: dragged. Applying the gate always uses every event.
-BEAD_PREVIEW_EVENTS = 250_000
-
-
 class Panel:
     """One plot on the canvas: what it shows, where it sits, and its layers.
 
@@ -157,8 +129,6 @@ class Panel:
         y: str = "",
         samples: Sequence[str] = (),
         parent: str = "<none>",
-        row: float = 0.0,
-        col: float = 0.0,
         colormap: str = "turbo",
     ):
         self.index = int(index)
@@ -168,8 +138,6 @@ class Panel:
         self.y = y
         self.samples = tuple(samples)
         self.parent = parent
-        self.row = float(row)
-        self.col = float(col)
 
         self.axes: Axes2D | None = None
         self.x_scale: Scale | None = None
@@ -212,34 +180,6 @@ class Panel:
             "samples": self.samples,
             "parent": self.parent,
         }
-
-    def contains(self, row: float, col: float, bins: int) -> bool:
-        """Whether a canvas point falls inside this panel's box.
-
-        Parameters
-        ----------
-        row, col
-            Canvas coordinates.
-        bins
-            Current panel size, in pixels.
-
-        Returns
-        -------
-        bool
-        """
-        return self.row - 0.5 <= row <= self.row + bins and self.col - 0.5 <= col <= self.col + bins
-
-    def remove_from(self, viewer) -> None:
-        """Take this panel's layers out of the viewer.
-
-        Parameters
-        ----------
-        viewer
-            The napari viewer holding them.
-        """
-        for layer in (self.image, self.curves):
-            if layer in viewer.layers:
-                viewer.layers.remove(layer)
 
 
 class CytoViewer:
@@ -401,13 +341,6 @@ class CytoViewer:
         self.gates = self.viewer.add_shapes(
             name=_GATES, face_color="#ffcc0022", edge_color="#ffcc00", edge_width=2
         )
-        # Read-only outline of the current bead gate, redrawn from the spin
-        # boxes; the editable shapes stay on the gates layer.
-        self.bead_gate = self.viewer.add_shapes(
-            name=_BEAD_GATE, face_color="transparent", edge_color="#4da6ff", edge_width=2
-        )
-        self.bead_gate.editable = False
-        self.bead_gate.visible = False
         self.viewer.layers.selection = {self.gates}
 
     def _raise_overlays(self) -> None:
@@ -422,7 +355,6 @@ class CytoViewer:
             self.labels,
             self.ylabel,
             self.applied,
-            self.bead_gate,
             self.gates,
         ):
             if layer in self.viewer.layers:
@@ -554,9 +486,6 @@ class CytoViewer:
             label="gating",
         )
         sections = [plot, style, gate]
-        beads = self._init_bead_widget()
-        if beads is not None:
-            sections.append(beads)
         self.widget = Container(widgets=[*sections, self.w_status])
 
         # Per-panel settings write to the active panel, then redraw.
@@ -588,11 +517,19 @@ class CytoViewer:
         self.viewer.window.add_dock_widget(self.widget, area="right", name="cytopy")
 
     # ------------------------------------------------------------- selection
+    @contextmanager
+    def _quiet(self):
+        """Set widget values without their ``changed`` callbacks firing back."""
+        self._updating = True
+        try:
+            yield
+        finally:
+            self._updating = False
+
     def _bind(self) -> None:
         """Point the per-panel widgets at the active panel."""
         panel = self.panel
-        self._updating = True
-        try:
+        with self._quiet():
             self.w_plot.value = panel.kind
             # A transform can add a layer while the window is open, so the
             # list has to be re-read before the value is set against it.
@@ -602,8 +539,6 @@ class CytoViewer:
             self.w_y.value = panel.y
             self.w_samples.value = [s for s in panel.samples if s in self.w_samples.choices]
             self.w_parent.value = panel.parent
-        finally:
-            self._updating = False
 
     def set_plot(self, **settings) -> None:
         """Change what the plot shows, and bring the widgets along.
@@ -647,247 +582,6 @@ class CytoViewer:
         panel.y = str(self.w_y.value)
         panel.samples = tuple(str(v) for v in self.w_samples.value)
         panel.parent = str(self.w_parent.value)
-        self.refresh()
-
-    # ------------------------------------------------------------------ beads
-    def _init_bead_widget(self):
-        """Build the bead-normalisation panel, or return None if there are no beads.
-
-        premessa's workflow, in the plot that is already on screen: put a bead
-        channel against DNA, drag the rectangle until it holds the beads and
-        nothing else, apply, normalise. Nothing happens to the data until you
-        ask: the first click creates the ``arcsinh(x / 5)`` layer the gates are
-        defined on and switches the plot to it.
-        """
-        from magicgui.widgets import ComboBox, Container, FloatSpinBox, Label, PushButton
-
-        try:
-            channels = bead_channels(self.adata, "fluidigm")
-            self.dna = dna_channel(self.adata)
-        except KeyError:
-            self.bead_gates = None
-            return None  # not mass cytometry, or not a panel with bead channels
-
-        self.bead_gates = bead_gates(self.adata, "fluidigm")
-        self._bead_sample: ad.AnnData | None = None
-        self.w_bead_set = ComboBox(label="bead set", choices=sorted(BEAD_PANELS), value="fluidigm")
-        self.w_bead_channel = ComboBox(label="bead channel", choices=channels, value=channels[0])
-        spin = {"min": -20.0, "max": 20.0, "step": 0.1}
-        self.w_bead_xlo = FloatSpinBox(label="bead min", **spin)
-        self.w_bead_xhi = FloatSpinBox(label="bead max", **spin)
-        self.w_bead_ylo = FloatSpinBox(label="DNA min", **spin)
-        self.w_bead_yhi = FloatSpinBox(label="DNA max", **spin)
-        self.w_bead_show = PushButton(text="plot bead channel vs DNA")
-        self.w_bead_from_shape = PushButton(text="gate from drawn rectangle")
-        self.w_bead_apply = PushButton(text="apply bead gate")
-        self.w_bead_norm = PushButton(text="normalise")
-        self.w_bead_status = Label(value="")
-
-        self.w_bead_set.changed.connect(self._bead_set_changed)
-        self.w_bead_channel.changed.connect(self._bead_channel_changed)
-        for w in (self.w_bead_xlo, self.w_bead_xhi, self.w_bead_ylo, self.w_bead_yhi):
-            w.changed.connect(self._bead_gate_edited)
-        self.w_bead_show.changed.connect(self._bead_channel_changed)
-        self.w_bead_from_shape.changed.connect(self._bead_gate_from_shape)
-        self.w_bead_apply.changed.connect(self._apply_bead_gate)
-        self.w_bead_norm.changed.connect(self._normalise_beads)
-
-        self._load_bead_gate()
-        return Container(
-            widgets=[
-                self.w_bead_set,
-                self.w_bead_channel,
-                self.w_bead_show,
-                self.w_bead_xlo,
-                self.w_bead_xhi,
-                self.w_bead_ylo,
-                self.w_bead_yhi,
-                self.w_bead_from_shape,
-                self.w_bead_apply,
-                self.w_bead_norm,
-                self.w_bead_status,
-            ],
-            label="beads",
-        )
-
-    def _ensure_bead_layer(self) -> None:
-        """Plot arcsinh(counts / 5), the space the bead gates are defined in."""
-        if BEAD_LAYER not in self.adata.layers:
-            asinh_transform(
-                self.adata,
-                BEAD_COFACTOR,
-                channels=[*mass_channels(self.adata), self.dna],
-                key_added=BEAD_LAYER,
-            )
-        self._updating = True
-        try:
-            self.w_ticks.value = "linear"
-        finally:
-            self._updating = False
-        self.set_plot(layer=BEAD_LAYER, x=self.w_bead_channel.value, y=self.dna)
-
-    def _load_bead_gate(self, *_) -> None:
-        """Push the stored gate for the current bead channel into the spin boxes."""
-        gate = self.bead_gates[str(self.w_bead_channel.value)]
-        self._updating = True
-        try:
-            self.w_bead_xlo.value, self.w_bead_xhi.value = gate["x"]
-            self.w_bead_ylo.value, self.w_bead_yhi.value = gate["y"]
-        finally:
-            self._updating = False
-
-    def _bead_set_changed(self, *_) -> None:
-        try:
-            channels = bead_channels(self.adata, str(self.w_bead_set.value))
-        except KeyError as exc:
-            self.w_bead_status.value = str(exc).split(";")[0]
-            return
-        self.bead_gates = bead_gates(self.adata, str(self.w_bead_set.value))
-        self._bead_sample = None
-        self._updating = True
-        try:
-            self.w_bead_channel.choices = channels
-            self.w_bead_channel.value = channels[0]
-        finally:
-            self._updating = False
-        self._bead_channel_changed()
-
-    def _bead_channel_changed(self, *_) -> None:
-        if self._updating:
-            return
-        self._load_bead_gate()
-        self._ensure_bead_layer()
-        self.refresh()
-
-    def _bead_gate_edited(self, *_) -> None:
-        if self._updating:
-            return
-        self.bead_gates[str(self.w_bead_channel.value)] = {
-            "x": (float(self.w_bead_xlo.value), float(self.w_bead_xhi.value)),
-            "y": (float(self.w_bead_ylo.value), float(self.w_bead_yhi.value)),
-        }
-        self._draw_bead_gate()
-        self._count_beads()
-
-    def _bead_gate_from_shape(self, *_) -> None:
-        """Adopt the bounding box of a rectangle drawn on the gates layer."""
-        if self.axes is None or not len(self.gates.data):
-            self.w_bead_status.value = "draw a rectangle on the canvas first"
-            return
-        verts = self.to_display(self.gates.data[-1])
-        lo, hi = verts.min(axis=0), verts.max(axis=0)
-        self._updating = True
-        try:
-            self.w_bead_xlo.value, self.w_bead_xhi.value = float(lo[0]), float(hi[0])
-            self.w_bead_ylo.value, self.w_bead_yhi.value = float(lo[1]), float(hi[1])
-        finally:
-            self._updating = False
-        self._bead_gate_edited()
-
-    def _draw_bead_gate(self) -> None:
-        """Outline the current channel's gate on the canvas."""
-        gate = self.bead_gates.get(str(self.w_x.value))
-        if self.axes is None or gate is None or self.w_layer.value != BEAD_LAYER:
-            self.bead_gate.data = []
-            self.bead_gate.visible = False
-            return
-        (x_lo, x_hi), (y_lo, y_hi) = gate["x"], gate["y"]
-        corners = self.to_canvas(
-            np.array([x_lo, x_hi, x_hi, x_lo]), np.array([y_lo, y_lo, y_hi, y_hi])
-        )
-        self.bead_gate.data = []
-        self.bead_gate.add_rectangles([corners])
-        self.bead_gate.visible = True
-
-    def bead_mask(self, adata: ad.AnnData | None = None) -> np.ndarray:
-        """Events inside the current bead gate, across every bead channel.
-
-        Parameters
-        ----------
-        adata
-            What to gate. Defaults to the viewer's own data; the panel passes
-            a subsample here to keep the live count cheap while a gate is
-            being dragged.
-
-        Returns
-        -------
-        ndarray
-            Boolean mask over the events of ``adata``.
-        """
-        return gate_beads(
-            adata if adata is not None else self.adata,
-            beads=list(self.bead_gates),
-            dna=self.dna,
-            gates=self.bead_gates,
-            key_added=None,
-        )
-
-    def _bead_preview(self) -> ad.AnnData:
-        """A fixed subsample the live count is estimated from.
-
-        Dragging a gate edge re-counts on every step, and at a few million
-        events an exact count makes the spin boxes lag. The subsample is drawn
-        once and reused, so the number moves smoothly as the gate moves and is
-        never off by more than sampling error; *apply* uses every event.
-        """
-        if self._bead_sample is None:
-            if self.adata.n_obs <= BEAD_PREVIEW_EVENTS:
-                self._bead_sample = self.adata
-            else:
-                rng = np.random.default_rng(0)
-                take = rng.choice(self.adata.n_obs, BEAD_PREVIEW_EVENTS, replace=False)
-                self._bead_sample = self.adata[np.sort(take)].copy()
-        return self._bead_sample
-
-    def _count_beads(self) -> None:
-        preview = self._bead_preview()
-        try:
-            n = int(self.bead_mask(preview).sum())
-        except ValueError:
-            self.w_bead_status.value = "gate holds no events"
-            return
-        fraction = n / preview.n_obs
-        estimate = "" if preview is self.adata else " est."
-        self.w_bead_status.value = (
-            f"{round(fraction * self.adata.n_obs):,} beads{estimate} ({100 * fraction:.2f}%)"
-        )
-
-    def _apply_bead_gate(self, *_) -> None:
-        try:
-            mask = gate_beads(
-                self.adata,
-                beads=list(self.bead_gates),
-                dna=self.dna,
-                gates=self.bead_gates,
-                key_added="bead",
-            )
-        except ValueError as exc:
-            self.w_bead_status.value = str(exc).split(";")[0]
-            return
-        self._updating = True
-        try:
-            self.w_parent.reset_choices()
-            self.w_gate_pick.reset_choices()
-        finally:
-            self._updating = False
-        self.w_bead_status.value = f"obs['bead']: {int(mask.sum()):,} events"
-
-    def _normalise_beads(self, *_) -> None:
-        if "bead" not in self.adata.obs:
-            self._apply_bead_gate()
-        if "bead" not in self.adata.obs:
-            return
-        try:
-            normalise_beads(self.adata, beads=list(self.bead_gates), dna=self.dna)
-        except (ValueError, KeyError) as exc:
-            self.w_bead_status.value = str(exc).split(";")[0]
-            return
-        self.adata.layers.pop(BEAD_LAYER, None)
-        self.set_plot(layer="normalised")
-        slopes = self.adata.obs["bead_slope"]
-        self.w_bead_status.value = (
-            f"normalised -> layers['normalised']; slope {slopes.min():.3f}-{slopes.max():.3f}"
-        )
         self.refresh()
 
     # ------------------------------------------------------------ appearance
@@ -977,53 +671,30 @@ class CytoViewer:
     def _matrix(self, layer: str):
         return self.adata.X if layer == "X" else self.adata.layers[layer]
 
-    def sample_scope(self, panel: Panel | None = None) -> np.ndarray:
-        """Events belonging to the samples the plot is showing.
-
-        The parent gate is deliberately not applied: this is what a gate is
-        allowed to *change*, and re-gating a sample should still be able to
-        turn an event off.
+    def selection_mask(self, *, sample: bool = True, parent: bool = True) -> np.ndarray:
+        """Events the plot is showing: its sample, narrowed by its parent gate.
 
         Parameters
         ----------
-        panel
-            Which panel; the active one by default.
-
-        Returns
-        -------
-        ndarray
-            Boolean mask over all events, all ``True`` when no sample is
-            picked.
-        """
-        panel = panel or self.panel
-        mask = np.ones(self.adata.n_obs, dtype=bool)
-        if panel.samples and "sample" in self.adata.obs:
-            labels = self.adata.obs["sample"].astype(str).to_numpy()
-            mask &= np.isin(labels, list(panel.samples))
-        return mask
-
-    def selection_mask(self, panel: Panel | None = None, *, sample: bool = True) -> np.ndarray:
-        """Events a panel plots: its sample, narrowed by its parent gate.
-
-        Parameters
-        ----------
-        panel
-            Which panel; the active one by default.
         sample
-            Apply the panel's sample. ``False`` keeps every sample, which is
+            Apply the chosen sample. ``False`` keeps every sample, which is
             how the axis limits stay put as you switch between them.
+        parent
+            Apply the parent gate. ``False`` gives the sample alone, which is
+            the scope a *new* gate is allowed to change: re-gating a sample
+            has to be able to turn an event off as well as on.
 
         Returns
         -------
         ndarray
             Boolean mask over all events.
         """
-        panel = panel or self.panel
+        panel = self.panel
         mask = np.ones(self.adata.n_obs, dtype=bool)
         if sample and panel.samples and "sample" in self.adata.obs:
             labels = self.adata.obs["sample"].astype(str).to_numpy()
             mask &= np.isin(labels, list(panel.samples))
-        if panel.parent != "<none>" and panel.parent in self.adata.obs:
+        if parent and panel.parent != "<none>" and panel.parent in self.adata.obs:
             mask &= self.adata.obs[panel.parent].to_numpy(dtype=bool)
         return mask
 
@@ -1035,29 +706,16 @@ class CytoViewer:
         return col[mask]
 
     def _axis_scale(self, channel: str, layer: str | None = None) -> Scale:
-        """How to label the axis for ``channel``. Tick placement only."""
+        """How to label the axis for ``channel``. Tick placement only.
+
+        The rule itself lives in :func:`~cytopy.axis_scale`, so the window and
+        the static figures cannot come to disagree about an axis. What is the
+        window's own is the **axis ticks** setting, which overrides it.
+        """
         layer = self.panel.layer if layer is None else layer
-        if self.w_ticks.value == "linear" or layer == "X" or not channel:
+        if self.w_ticks.value == "linear" or not channel:
             return LinearScale()
-        info = self.adata.uns.get("cytopy", {})
-        name = str(self.adata.var_names[channel_index(self.adata, channel)])
-        # Per-layer first: a file transformed twice keeps both labelled.
-        cofactor = info.get("asinh_layers", {}).get(layer, {}).get(name)
-        if cofactor is not None:
-            return PretransformedScale(AsinhScale(cofactor=float(cofactor)))
-        params = info.get("logicle_layers", {}).get(layer, {}).get(name)
-        if params is not None:
-            return PretransformedScale(LogicleScale(**dict(params)))
-        j = channel_index(self.adata, channel)
-        if layer == info.get("asinh_layer") and "cofactor" in self.adata.var:
-            cof = float(self.adata.var["cofactor"].iloc[j])
-            if np.isfinite(cof):
-                return PretransformedScale(AsinhScale(cofactor=cof))
-        if layer == info.get("logicle_layer"):
-            params = info.get("logicle_params", {}).get(str(self.adata.var_names[j]))
-            if params:
-                return PretransformedScale(LogicleScale(**params))
-        return LinearScale()
+        return axis_scale(self.adata, channel, layer)
 
     def _describe_transform(self) -> str:
         layer = self.panel.layer
@@ -1075,24 +733,20 @@ class CytoViewer:
         """Whether the active panel draws distributions rather than a density."""
         return self.panel.histogram
 
-    def histogram_groups(self, panel: Panel | None = None) -> list[tuple[str, np.ndarray]]:
+    def histogram_groups(self) -> list[tuple[str, np.ndarray]]:
         """``(name, mask)`` per curve, within the parent gate.
 
         Which samples get a curve is the panel's own choice; picking none means
         all of them, so the plot is never accidentally empty.
 
-        Parameters
-        ----------
-        panel
-            Which panel; the active one by default.
 
         Returns
         -------
         list of tuple
             Empty when the panel's selection holds no events.
         """
-        panel = panel or self.panel
-        mask = self.selection_mask(panel, sample=False)
+        panel = self.panel
+        mask = self.selection_mask(sample=False)
         if not mask.any() or "sample" not in self.adata.obs:
             return [("all", mask)] if mask.any() else []
         labels = self.adata.obs["sample"].astype(str).to_numpy()
@@ -1107,7 +761,7 @@ class CytoViewer:
     def _draw_curves(self, panel: Panel, mask: np.ndarray) -> float:
         """One smoothed distribution of the panel's x channel per sample."""
         ax = panel.axes
-        groups = self.histogram_groups(panel)
+        groups = self.histogram_groups()
         curves, colours, legend = [], [], []
         for index, (name, group) in enumerate(groups):
             values = self._column(panel.x, group, panel.layer)
@@ -1168,20 +822,18 @@ class CytoViewer:
         panel.curves.data = []
         panel.curves.add(shapes, shape_type=kinds, face_color=faces, edge_color=edges, edge_width=2)
         panel.legend = [
-            (panel.row + 0.04 * self.bins + i * step, panel.col + 0.78 * self.bins, text)
-            for i, text in enumerate(legend)
+            (0.04 * self.bins + i * step, 0.78 * self.bins, text) for i, text in enumerate(legend)
         ]
         return _MODE_TOP
 
     def _status(self) -> str:
         panel = self.panel
-        n = int(self.selection_mask(panel).sum())
-        which = ""
+        n = int(self.selection_mask().sum())
         if panel.histogram:
-            return f"{which}   {n:,} events   ({panel.x})   {len(self.histogram_groups())} curve(s)"
+            return f"{n:,} events   ({panel.x})   {len(self.histogram_groups())} curve(s)"
         smoothed = " smoothed" if self.w_smooth.value else ""
         peak = f"   peak {self.peak_density():,.0f}{smoothed} events/bin"
-        return f"{which}   {n:,} events   ({panel.x} × {panel.y}){peak}"
+        return f"{n:,} events   ({panel.x} × {panel.y}){peak}"
 
     # -------------------------------------------------------------- rendering
     def refresh(self, *_) -> None:
@@ -1202,13 +854,11 @@ class CytoViewer:
 
         self._draw_applied_gates()
         self._draw_axes()
-        if getattr(self, "bead_gates", None):
-            self._draw_bead_gate()
         self.w_status.value = self._status()
 
     def _draw_panel(self, panel: Panel) -> None:
         """Compute and draw one panel's density or curves."""
-        mask = self.selection_mask(panel)
+        mask = self.selection_mask()
         panel.x_scale = self._axis_scale(panel.x, panel.layer)
         panel.y_scale = self._axis_scale(panel.y, panel.layer)
         panel.legend = []
@@ -1223,7 +873,7 @@ class CytoViewer:
         xv = self._column(panel.x, mask, panel.layer)
         scope = mask
         if self.w_lock.value and panel.samples:
-            scope = self.selection_mask(panel, sample=False)
+            scope = self.selection_mask(sample=False)
         x_lo, x_hi = self._limits(panel.x_scale, self._column(panel.x, scope, panel.layer))
         if panel.histogram:
             y_lo, y_hi = 0.0, 1.0
@@ -1235,7 +885,6 @@ class CytoViewer:
             panel.image.visible = False
             panel.curves.visible = True
             panel.peak = self._draw_curves(panel, mask)
-            panel.curves.translate = (panel.row, panel.col)
             return
 
         panel.curves.visible = False
@@ -1249,7 +898,6 @@ class CytoViewer:
         )
         panel.image.data = image
         panel.image.colormap = faded_colormap(self.w_cmap.value)
-        panel.image.translate = (panel.row, panel.col)
         panel.peak = float(image.max())
 
     def _draw_applied_gates(self) -> None:
@@ -1264,22 +912,21 @@ class CytoViewer:
         gates = self.adata.uns.get("cytopy", {}).get("gates", {})
         shapes, kinds = [], []
         self._gate_labels: list[tuple[float, float, str]] = []
-        for panel in (self.panel,):
-            if panel.axes is None or panel.histogram:
-                continue
-            for name, record in gates.items():
-                if str(record.get("x", "")) != panel.x or str(record.get("y", "")) != panel.y:
+        panel = self.panel
+        if panel.axes is not None and not panel.histogram:
+            for name in list(gates):
+                record = gate_record(self.adata, name)
+                if record.x != panel.x or record.y != panel.y:
                     continue
-                if str(record.get("layer", "X") or "X") != panel.layer:
+                if record.layer != panel.layer:
                     continue
-                vertices = record.get("vertices")
-                if not vertices:
+                if not record.has_outline():
                     continue
                 # Of its own parent, the way a cytometrist reads a hierarchy --
                 # not of whatever the panel happens to be showing, which would
                 # make the same gate read differently from panel to panel.
                 n = int(self.adata.obs[name].sum()) if name in self.adata.obs else 0
-                above = str(record.get("parent") or "")
+                above = record.parent
                 total = (
                     int(self.adata.obs[above].sum())
                     if above and above in self.adata.obs
@@ -1287,13 +934,9 @@ class CytoViewer:
                 ) or 1
 
                 corner = None
-                for verts, kind in zip(
-                    vertices, record.get("shape_types") or ["polygon"] * len(vertices)
-                ):
-                    verts = np.asarray(verts, dtype=float)
-                    pixels = self.to_canvas(verts[:, 0], verts[:, 1], panel)
+                for pixels, kind in self._to_canvas_shapes(record.vertices, record.shape_types):
                     shapes.append(pixels)
-                    kinds.append(str(kind))
+                    kinds.append(kind)
                     top_left = (float(pixels[:, 0].min()), float(pixels[:, 1].min()))
                     corner = top_left if corner is None else min(corner, top_left)
                 if corner is not None:
@@ -1338,11 +981,10 @@ class CytoViewer:
         lines: list[np.ndarray] = []
         coords: list[list[float]] = []
         text: list[str] = []
-        for panel in (self.panel,):
-            ax = panel.axes
-            if ax is None:
-                continue
-            dr, dc = panel.row, panel.col
+        panel = self.panel
+        ax = panel.axes
+        if ax is not None:
+            dr = dc = 0.0
             lines += [
                 np.array([[dr - 0.5, dc - 0.5], [dr - 0.5, dc + b - 0.5]]),
                 np.array([[dr + b - 0.5, dc - 0.5], [dr + b - 0.5, dc + b - 0.5]]),
@@ -1418,28 +1060,7 @@ class CytoViewer:
         self.set_plot(x=self.panel.y, y=self.panel.x)
 
     # ------------------------------------------------------------------ gating
-    def _offset(self, panel: Panel | None = None) -> np.ndarray:
-        """Where a panel's top-left corner sits on the canvas, as ``(row, col)``.
-
-        Shapes are drawn in canvas coordinates; a panel's axes work in its own
-        0..bins box. Everything that converts between the two has to go through
-        here, or a gate drawn on a panel that is not at the origin lands
-        somewhere else entirely.
-
-        Parameters
-        ----------
-        panel
-            Which panel; the active one by default.
-
-        Returns
-        -------
-        ndarray
-            ``(row, col)``.
-        """
-        panel = panel or self.panel
-        return np.array([panel.row, panel.col], dtype=float)
-
-    def to_display(self, shape, panel: Panel | None = None) -> np.ndarray:
+    def to_display(self, shape) -> np.ndarray:
         """Canvas coordinates of a shape, in the values the panel is plotting.
 
         Parameters
@@ -1454,12 +1075,11 @@ class CytoViewer:
         ndarray
             ``(n, 2)`` of ``(x, y)`` data values.
         """
-        panel = panel or self.panel
-        verts = np.asarray(shape, dtype=float) - self._offset(panel)
-        return panel.axes.to_display(verts)
+        verts = np.asarray(shape, dtype=float)
+        return self.panel.axes.to_display(verts)
 
-    def to_canvas(self, x, y, panel: Panel | None = None) -> np.ndarray:
-        """Where data values land on the canvas, panel offset included.
+    def to_canvas(self, x, y) -> np.ndarray:
+        """Where data values land on the canvas.
 
         Parameters
         ----------
@@ -1473,14 +1093,13 @@ class CytoViewer:
         ndarray
             ``(n, 2)`` of ``(row, col)`` canvas coordinates.
         """
-        panel = panel or self.panel
-        return panel.axes.to_pixels(np.asarray(x), np.asarray(y)) + self._offset(panel)
+        return self.panel.axes.to_pixels(np.asarray(x), np.asarray(y))
 
     def current_gate_mask(self) -> np.ndarray:
         """Mask over *all* events of those inside the shapes drawn on the canvas.
 
-        Worked out in data coordinates rather than pixels, so it does not
-        matter where on the canvas the panel has been moved to.
+        Worked out in data coordinates rather than pixels, so a rescale of
+        the axes cannot change which events a drawn shape holds.
 
         On a histogram there is no second channel to be inside of, so a shape
         gates the interval it spans on the x axis -- drag a box over a peak and
@@ -1518,6 +1137,20 @@ class CytoViewer:
             [str(k) for k in self.gates.shape_type],
         )
 
+    def _to_canvas_shapes(self, shapes, kinds):
+        """Outlines in data coordinates, as canvas pixels ready for a Shapes layer."""
+        out = []
+        for verts, kind in zip(shapes, kinds):
+            verts = np.asarray(verts, dtype=float)
+            out.append((self.to_canvas(verts[:, 0], verts[:, 1]), str(kind)))
+        return out
+
+    def _put_on_gates_layer(self, shapes, kinds) -> None:
+        """Replace whatever is on the editable gates layer with these outlines."""
+        self.gates.data = []
+        for pixels, kind in self._to_canvas_shapes(shapes, kinds):
+            self.gates.add(pixels, shape_type=kind)
+
     def _restore_shapes(self, drawn) -> None:
         """Redraw shapes so they keep covering the same data after a rescale.
 
@@ -1528,11 +1161,7 @@ class CytoViewer:
         """
         if drawn is None or self.axes is None:
             return
-        shapes, kinds = drawn
-        pixels = [self.to_canvas(v[:, 0], v[:, 1]) for v in shapes]
-        self.gates.data = []
-        for verts, kind in zip(pixels, kinds):
-            self.gates.add(verts, shape_type=kind)
+        self._put_on_gates_layer(*drawn)
 
     def off_axis_count(self) -> int:
         """Events in the current selection that fall outside the plotted axes.
@@ -1587,12 +1216,9 @@ class CytoViewer:
         """
         if not len(self.gates.data):
             raise ValueError("draw a shape on the canvas first")
-        self._updating = True
-        try:
+        with self._quiet():
             self.w_gate_name.value = name
             self.w_parent.value = parent or "<none>"
-        finally:
-            self._updating = False
         self.refresh()
         self._apply_gate()
         return self.adata.obs[name].to_numpy(dtype=bool)
@@ -1618,35 +1244,24 @@ class CytoViewer:
             If the gate was never recorded, or recorded no outline: one
             applied from a mask rather than drawn cannot be put back.
         """
-        gates = self.adata.uns.get("cytopy", {}).get("gates", {})
-        if name not in gates:
-            raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
-        record = gates[name]
-        vertices = record.get("vertices")
-        if not vertices:
+        record = gate_record(self.adata, name)
+        if not record.vertices:
             raise KeyError(f"gate {name!r} recorded no outline, so there is nothing to adjust")
 
         panel = self.panel
-        panel.x = str(record.get("x", panel.x))
-        panel.y = str(record.get("y", panel.y))
-        panel.layer = str(record.get("layer", panel.layer)) or "X"
+        panel.x = record.x or panel.x
+        panel.y = record.y or panel.y
+        panel.layer = record.layer
         # Its own parent, not itself: a gate cannot be nested inside itself.
-        panel.parent = str(record.get("parent") or "<none>")
-        panel.kind = str(record.get("kind", "density"))
+        panel.parent = record.parent or "<none>"
+        panel.kind = record.kind
         self._bind()
         self.refresh()
 
-        kinds = record.get("shape_types") or ["polygon"] * len(vertices)
-        self.gates.data = []
-        for verts, kind in zip(vertices, kinds):
-            verts = np.asarray(verts, dtype=float)
-            self.gates.add(self.to_canvas(verts[:, 0], verts[:, 1]), shape_type=str(kind))
-        self._updating = True
-        try:
+        self._put_on_gates_layer(record.vertices, record.shape_types)
+        with self._quiet():
             self.w_gate_name.value = name
             self.w_gate_pick.value = name
-        finally:
-            self._updating = False
         self.w_status.value = f"{name} loaded: adjust it, then apply to replace it"
 
     def delete_gate(self, name: str) -> list[str]:
@@ -1667,9 +1282,8 @@ class CytoViewer:
         KeyError
             If the gate was never recorded.
         """
+        gate_record(self.adata, name)  # raises, listing what is recorded
         gates = self.adata.uns.get("cytopy", {}).get("gates", {})
-        if name not in gates:
-            raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
         gone = [name]
         for child in gate_children(self.adata, name):
             gone += self.delete_gate(child)
@@ -1683,12 +1297,9 @@ class CytoViewer:
         return gone
 
     def _refresh_gate_choices(self) -> None:
-        self._updating = True
-        try:
+        with self._quiet():
             self.w_parent.reset_choices()
             self.w_gate_pick.reset_choices()
-        finally:
-            self._updating = False
 
     def _load_gate_clicked(self, *_) -> None:
         name = str(self.w_gate_pick.value)
@@ -1728,7 +1339,7 @@ class CytoViewer:
             parent=parent,
             # Only the samples on screen: gating one file does not undo the
             # gate drawn on another under the same name.
-            within=self.sample_scope(),
+            within=self.selection_mask(parent=False),
             meta={
                 "kind": self.panel.kind,
                 "x": str(self.w_x.value),
@@ -1906,100 +1517,103 @@ def _hide_overlays(viewer) -> None:
             legacy.visible = False
 
 
-def gate(
+#: The window this session last opened, so a non-blocking call does not let it
+#: be collected and ``current_viewer`` has something to hand back.
+_CURRENT: CytoViewer | None = None
+
+
+def current_viewer() -> CytoViewer | None:
+    """The :class:`CytoViewer` behind the window :func:`open_napari` last opened.
+
+    Reach for this only to drive the window from code -- changing the plot,
+    applying a gate by name, asking what is selected. The gates themselves land
+    on the AnnData that :func:`open_napari` returns, so ordinary use never
+    needs it.
+
+    Returns
+    -------
+    CytoViewer or None
+        ``None`` before a window has been opened in this session.
+    """
+    return _CURRENT
+
+
+def open_napari(
     adata,
+    layer: str = "raw",
     *,
-    layer: str | None = None,
-    cofactor: float | None = None,
+    x: str | None = None,
+    y: str | None = None,
+    samples: Sequence[str] | None = None,
+    names: Sequence[str] | None = None,
     block: bool | None = None,
-    **kwargs,
+    verbose: bool = False,
 ) -> ad.AnnData:
-    """Open napari to gate some data, and hand the data back when you close it.
+    """Open the cytopy window on some data, and hand the data back when you close it.
 
-    Gate as many times as you like in the one window: draw on one pair of
-    channels, apply, change the channels, set **parent gate** to what you just
-    drew, gate again. Each gate becomes a boolean column in ``adata.obs`` and
-    its outline is recorded in ``adata.uns['cytopy']['gates']``.
+    One window for both jobs. Look at the data, or draw gates on it, or both --
+    the window is the same either way, which is why this is not called
+    ``view`` or ``gate``.
 
-    **Gates already on the data are loaded.** Call this again on the same
-    object and they are outlined where you drew them, listed under **edit
-    gate**, and available as parents -- so gating is something you come back
-    to rather than do in one sitting.
+    Each gate you apply becomes a boolean column in ``adata.obs``, with its
+    outline recorded in ``adata.uns['cytopy']['gates']``. **Gates already on
+    the data are loaded**, outlined where you drew them and offered as parents,
+    so gating is something you come back to rather than do in one sitting.
+
+    The bin count, colour map, axis ticks and background are chosen in the
+    window, so they are not arguments here. The channels and the sample are,
+    because knowing what you want to look at before you open it is common
+    enough to be worth saving the clicks -- but they are only a starting
+    point, and the window owns them afterwards.
 
     Parameters
     ----------
     adata
-        What to gate, or anything :func:`view` accepts. Modified in place.
+        What to open. One events x channels AnnData, e.g. from
+        :func:`cytopy.read_fcs`; a path to an FCS file, an ``.h5ad`` or a
+        directory of FCS files; or several of either as a list or a
+        ``{name: object}`` mapping, concatenated on the channels they share.
+        Modified in place.
     layer
-        Matrix to plot. ``None`` uses ``adata.X``.
-    cofactor
-        Arcsinh cofactor. Given with a ``layer`` that does not exist yet, the
-        layer is made with it first, so a raw file can be gated on a sensible
-        scale without a separate step.
+        Layer to plot first, by name. Plotted exactly as stored -- run the
+        transform you want before opening. You can change it in the window.
+    x, y
+        Channels to put on the axes to begin with, by marker or detector.
+        ``None`` leaves the window on the first two channels.
+    samples
+        Samples to show to begin with, as they appear in ``obs['sample']``.
+        ``None`` shows every one of them.
+    names
+        Names for the samples, one per object, overriding whatever they carry.
     block
-        Wait for the window to close before returning. Defaults to ``True``
-        from a script, ``False`` under IPython, as :func:`view` does.
-    **kwargs
-        Passed to :func:`view` -- ``x``, ``y``, ``bins``, ``background`` and
-        the rest.
+        Wait for the window to close before returning. The default detects the
+        context: ``True`` from a script, ``False`` under IPython, where a Qt
+        loop is already running and blocking would wedge the kernel.
+
+        A non-blocking call returns **before you have drawn anything**. The
+        data is modified in place, so the gates appear on the object you were
+        handed as you draw them, but it is not gated at the moment it returns.
+    verbose
+        Print which gates were loaded and which were drawn.
 
     Returns
     -------
     AnnData
-        The data, with whatever you gated on it.
+        The data, with whatever you gated on it. The window itself, if you
+        need to drive it from code, is :func:`current_viewer`.
     """
-    from .transforms import asinh_transform
-
-    adata = as_one_anndata(adata)
-    if layer is not None and layer not in adata.layers and cofactor is not None:
-        asinh_transform(adata, cofactor, key_added=layer)
-    existing = list(adata.uns.get("cytopy", {}).get("gates", {}))
-    if existing:
-        print(f"loaded {len(existing)} gate(s): {', '.join(existing)}")
-    view(adata, layer=layer, block=block, **kwargs)
-    drawn = [g for g in adata.uns.get("cytopy", {}).get("gates", {}) if g not in existing]
-    print(f"gated: {', '.join(drawn) if drawn else 'nothing new'}")
-    return adata
-
-
-def view(adata, *, block: bool | None = None, **kwargs) -> CytoViewer:
-    """Open the cytopy napari window on one or several samples.
-
-    Plots the chosen layer as stored — run any transform you want first.
-
-    Several objects are concatenated on the channels they share and become
-    entries in the **sample** selector, so one window browses the lot::
-
-        cytopy.view([run1, run2, run3])
-        cytopy.view({"healthy": run1, "treated": run2})
-        cytopy.view("data/")                       # every FCS in a directory
-
-    Parameters
-    ----------
-    adata
-        What to plot. One events x channels AnnData, e.g. from
-        :func:`cytopy.read_fcs`; a path to an FCS file, an ``.h5ad`` or a
-        directory; or several of either as a list or a ``{name: object}``
-        mapping.
-    block
-        Start the Qt event loop and return only once the window closes. The
-        default detects the context: ``True`` from a script, ``False`` under
-        IPython/Jupyter where a loop is already running. Gates drawn in the
-        window are on ``adata.obs`` by the time a blocking call returns.
-    **kwargs
-        Passed to :class:`CytoViewer` — ``names``, ``layer``, ``x``, ``y``,
-        ``ticks``, ``bins``, ``colormap``, ``smooth``, ``robust``,
-        ``background``, ``viewer``, ``title``.
-
-    Returns
-    -------
-    CytoViewer
-        The viewer, so gates and the current selection stay reachable
-        afterwards.
-    """
+    global _CURRENT
     import napari
 
-    cv = CytoViewer(adata, **kwargs)
+    adata = as_one_anndata(adata, names=names)
+    before = list(adata.uns.get("cytopy", {}).get("gates", {}))
+    if verbose and before:
+        print(f"loaded {len(before)} gate(s): {', '.join(before)}")
+
+    _CURRENT = CytoViewer(adata, layer=layer, x=x, y=y)
+    if samples is not None:
+        _CURRENT.set_plot(samples=samples)
+
     if block is None:
         try:
             get_ipython  # type: ignore[name-defined]  # noqa: B018
@@ -2008,4 +1622,9 @@ def view(adata, *, block: bool | None = None, **kwargs) -> CytoViewer:
             block = True
     if block:
         napari.run()
-    return cv
+
+    if verbose:
+        after = adata.uns.get("cytopy", {}).get("gates", {})
+        drawn = [g for g in after if g not in before]
+        print(f"gated: {', '.join(drawn) if drawn else 'nothing new'}")
+    return adata

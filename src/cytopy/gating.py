@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 
 __all__ = [
+    "GateRecord",
     "add_gate",
+    "ellipse_mask",
     "gate_children",
     "gate_mask",
+    "gate_order",
+    "gate_record",
     "gate_stats",
     "polygon_mask",
     "recompute_gates",
     "rectangle_to_polygon",
+    "shapes_mask",
 ]
 
 
@@ -129,6 +135,139 @@ def shapes_mask(
                 points, rectangle_to_polygon(verts) if kind == "rectangle" else verts
             )
     return mask
+
+
+#: How "use ``adata.X``" is spelled inside ``uns``. Stored as a string so a
+#: gate record survives a round trip through h5ad.
+LAYER_X = "X"
+
+
+def _as_shapes(value) -> list[np.ndarray]:
+    """Outlines from a record, as float arrays.
+
+    Written for the fact that ``uns`` comes back from h5ad holding numpy
+    arrays where it was given lists, so neither ``if value`` nor ``value or
+    []`` is safe here -- both raise on an array with more than one element.
+    """
+    if value is None:
+        return []
+    return [np.asarray(v, dtype=float) for v in value]
+
+
+@dataclass(frozen=True)
+class GateRecord:
+    """A gate as it was recorded, decoded once so callers stop re-parsing ``uns``.
+
+    Built by :func:`gate_record`. Read-only: :func:`add_gate` remains the only
+    thing that writes a gate. ``raw`` keeps the untouched ``uns`` entry, because
+    :func:`add_gate` merges arbitrary ``meta`` into a record and a closed type
+    would silently drop whatever it did not know about.
+    """
+
+    name: str
+    parent: str = ""
+    x: str = ""
+    y: str = ""
+    layer: str = LAYER_X
+    vertices: list[np.ndarray] = field(default_factory=list)
+    shape_types: list[str] = field(default_factory=list)
+    n: int = 0
+    kind: str = "density"
+    raw: dict = field(default_factory=dict)
+
+    def has_outline(self) -> bool:
+        """Whether this gate was drawn, and so can be recomputed or redrawn."""
+        return bool(self.vertices) and bool(self.x) and bool(self.y)
+
+    def shapes(self) -> Iterator[tuple[np.ndarray, str]]:
+        """Each outline with the kind of shape it was drawn as."""
+        return zip(self.vertices, self.shape_types)
+
+
+def gate_record(adata: ad.AnnData, name: str) -> GateRecord:
+    """The recorded gate ``name``, decoded.
+
+    Every reader of ``uns['cytopy']['gates']`` goes through here, so the
+    sentinel for ``adata.X``, the default shape kind and the h5ad round trip
+    are handled once rather than at each call site.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying the gate in ``uns['cytopy']['gates']``.
+    name
+        The gate to look up.
+
+    Returns
+    -------
+    GateRecord
+        The decoded record.
+
+    Raises
+    ------
+    KeyError
+        If the gate was never recorded. The message lists the ones that are.
+    """
+    gates = adata.uns.get("cytopy", {}).get("gates", {})
+    if name not in gates:
+        raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
+    raw = dict(gates[name])
+
+    vertices = _as_shapes(raw.get("vertices"))
+    kinds = raw.get("shape_types")
+    kinds = [] if kinds is None else [str(k) for k in kinds]
+    if len(kinds) != len(vertices):
+        kinds = ["polygon"] * len(vertices)
+
+    stored = str(raw.get("layer", LAYER_X))
+    return GateRecord(
+        name=name,
+        parent=str(raw.get("parent") or ""),
+        x=str(raw.get("x") or ""),
+        y=str(raw.get("y") or ""),
+        layer=LAYER_X if stored == "" else stored,
+        vertices=vertices,
+        shape_types=kinds,
+        n=int(raw.get("n", 0)),
+        kind=str(raw.get("kind") or "density"),
+        raw=raw,
+    )
+
+
+def gate_order(adata: ad.AnnData) -> list[str]:
+    """Every recorded gate, parents before their children.
+
+    Depth first, so a gate always appears after the one it is nested in.
+    Anything whose parent is missing is treated as top level rather than
+    dropped, so a partly hand-built hierarchy still lists in full.
+
+    Parameters
+    ----------
+    adata
+        AnnData carrying the gates.
+
+    Returns
+    -------
+    list of str
+        Gate names, parents first.
+    """
+    gates = adata.uns.get("cytopy", {}).get("gates", {})
+    parents = {g: str(record.get("parent") or "") for g, record in gates.items()}
+
+    order: list[str] = []
+
+    def _walk(under: str) -> None:
+        """Depth first, appending every gate nested under ``under``."""
+        for gate, parent in parents.items():
+            if parent == under and gate not in order:
+                order.append(gate)
+                _walk(gate)
+
+    _walk("")
+    for gate in gates:  # orphans: a parent that was never recorded
+        if gate not in order:
+            order.append(gate)
+    return order
 
 
 def add_gate(
@@ -254,32 +393,26 @@ def gate_mask(adata: ad.AnnData, name: str) -> np.ndarray:
         If the gate was never recorded, or recorded no outline -- one applied
         from a mask rather than drawn cannot be recomputed.
     """
-    gates = adata.uns.get("cytopy", {}).get("gates", {})
-    if name not in gates:
-        raise KeyError(f"no gate {name!r}; recorded gates are {sorted(gates)}")
-    record = gates[name]
-    vertices = record.get("vertices")
-    if not vertices or "x" not in record or "y" not in record:
+    record = gate_record(adata, name)
+    if not record.has_outline():
         raise KeyError(f"gate {name!r} has no outline to recompute from")
 
+    from ._util import layer_matrix
     from .transforms import channel_index
 
-    layer = str(record.get("layer", "X"))
-    matrix = adata.X if layer in ("X", "") else adata.layers[layer]
-    xi = channel_index(adata, record["x"])
-    yi = channel_index(adata, record["y"])
+    matrix = layer_matrix(adata, record.layer)
+    xi = channel_index(adata, record.x)
+    yi = channel_index(adata, record.y)
     points = np.column_stack(
         [
             np.asarray(matrix[:, xi], dtype=np.float64).ravel(),
             np.asarray(matrix[:, yi], dtype=np.float64).ravel(),
         ]
     )
-    kinds = record.get("shape_types") or ["polygon"] * len(vertices)
-    mask = shapes_mask(points, [np.asarray(v, dtype=float) for v in vertices], list(kinds))
+    mask = shapes_mask(points, record.vertices, record.shape_types)
 
-    parent = record.get("parent") or ""
-    if parent and parent in adata.obs:
-        mask = mask & adata.obs[parent].to_numpy(dtype=bool)
+    if record.parent and record.parent in adata.obs:
+        mask = mask & adata.obs[record.parent].to_numpy(dtype=bool)
     return mask
 
 

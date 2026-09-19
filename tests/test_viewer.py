@@ -11,7 +11,7 @@ pytest.importorskip("qtpy")
 def cv(demo, make_napari_viewer):
     import cytopy
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     from cytopy.viewer import CytoViewer
 
     return CytoViewer(
@@ -34,7 +34,6 @@ def test_layers_exist(cv):
         "axis labels",
         "y axis label",
         "applied gates",
-        "bead gate",
         "gates",
     ]
 
@@ -183,133 +182,9 @@ def test_channels_can_be_named_by_marker_or_detector(demo, make_napari_viewer):
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     cv = CytoViewer(demo, layer="asinh", x="CD3", y="PE-A", bins=64, viewer=make_napari_viewer())
     assert (cv.w_x.value, cv.w_y.value) == ("CD3 (FITC-A)", "CD19 (PE-A)")
-
-
-# --------------------------------------------------------------------------
-# the bead panel
-# --------------------------------------------------------------------------
-@pytest.fixture
-def bead_cv(cytof, make_napari_viewer):
-    from cytopy.viewer import CytoViewer
-
-    return CytoViewer(cytof, bins=128, viewer=make_napari_viewer())
-
-
-def test_no_bead_panel_without_bead_channels(cv):
-    """A flow panel has no bead channels, so the panel is not built at all."""
-    assert cv.bead_gates is None
-    assert not hasattr(cv, "w_bead_apply")
-
-
-def test_bead_panel_starts_on_premessas_gate(bead_cv):
-    assert bead_cv.dna == "DNA2 (Ir193Di)"
-    assert list(bead_cv.bead_gates) == ["Ce140Di", "Eu151Di", "Eu153Di", "Ho165Di", "Lu175Di"]
-    assert (bead_cv.w_bead_xlo.value, bead_cv.w_bead_xhi.value) == (2.0, 5.0)
-    assert (bead_cv.w_bead_ylo.value, bead_cv.w_bead_yhi.value) == (-1.0, 2.0)
-
-
-def test_the_panel_does_nothing_until_asked(bead_cv):
-    """It builds an arcsinh layer, so it waits to be told to."""
-    assert list(bead_cv.adata.layers) == [None, "raw"]
-    assert bead_cv.w_layer.value == "X"
-    assert not bead_cv.viewer.layers["bead gate"].visible
-
-
-def test_picking_a_bead_channel_plots_it_against_dna(bead_cv):
-    from cytopy.viewer import BEAD_LAYER
-
-    bead_cv.w_bead_channel.value = "Eu151Di"
-    assert bead_cv.w_layer.value == BEAD_LAYER
-    assert (bead_cv.w_x.value, bead_cv.w_y.value) == ("Eu151Di", "DNA2 (Ir193Di)")
-    assert bead_cv.viewer.layers["bead gate"].visible
-    assert len(bead_cv.viewer.layers["bead gate"].data) == 1
-
-
-def test_editing_the_gate_updates_the_count_and_the_outline(bead_cv):
-    bead_cv._bead_channel_changed()  # the "plot bead channel vs DNA" button
-    before = int(bead_cv.bead_mask().sum())
-    outline = np.asarray(bead_cv.viewer.layers["bead gate"].data[0]).copy()
-
-    bead_cv.w_bead_xlo.value = 4.0
-    assert bead_cv.bead_gates["Ce140Di"]["x"] == (4.0, 5.0)
-    assert int(bead_cv.bead_mask().sum()) < before
-    assert "beads" in bead_cv.w_bead_status.value
-    assert not np.allclose(np.asarray(bead_cv.viewer.layers["bead gate"].data[0]), outline)
-
-
-def test_gate_from_a_drawn_rectangle(bead_cv):
-    """The premessa gesture: drag a box round the beads, adopt it."""
-    bead_cv._bead_channel_changed()
-    corners = bead_cv.axes.to_pixels(
-        np.array([2.5, 4.5, 4.5, 2.5]), np.array([-0.5, -0.5, 1.0, 1.0])
-    )
-    bead_cv.gates.add_rectangles([corners])
-    bead_cv._bead_gate_from_shape()
-
-    x_lo, x_hi = bead_cv.bead_gates["Ce140Di"]["x"]
-    y_lo, y_hi = bead_cv.bead_gates["Ce140Di"]["y"]
-    assert (x_lo, x_hi) == pytest.approx((2.5, 4.5), abs=0.05)
-    assert (y_lo, y_hi) == pytest.approx((-0.5, 1.0), abs=0.05)
-
-
-def test_apply_and_normalise_from_the_panel(bead_cv):
-    bead_cv._apply_bead_gate()
-    assert "bead" in bead_cv.adata.obs
-    assert bead_cv.adata.obs["bead"].sum() > 100
-    assert "bead" in bead_cv.w_parent.choices
-
-    bead_cv._normalise_beads()
-    assert "normalised" in bead_cv.adata.layers
-    assert bead_cv.w_layer.value == "normalised"
-    assert "slope" in bead_cv.w_bead_status.value
-
-
-def test_a_gate_holding_nothing_is_reported_not_raised(bead_cv):
-    bead_cv._bead_channel_changed()
-    bead_cv.w_bead_xlo.value = 19.0
-    bead_cv._apply_bead_gate()
-    assert "no events" in bead_cv.w_bead_status.value
-    assert "bead" not in bead_cv.adata.obs
-
-
-def test_live_count_is_estimated_from_a_subsample(cytof, make_napari_viewer, monkeypatch):
-    """Dragging a gate edge must not re-scan every event on every step."""
-    import cytopy.viewer as viewer_module
-    from cytopy.viewer import CytoViewer
-
-    monkeypatch.setattr(viewer_module, "BEAD_PREVIEW_EVENTS", 5_000)
-    cv = CytoViewer(cytof, bins=128, viewer=make_napari_viewer())
-    cv._bead_channel_changed()
-
-    cv.w_bead_xlo.value = 2.1
-    assert cv._bead_sample.n_obs == 5_000
-    assert "est." in cv.w_bead_status.value
-
-    sampled = cv._bead_sample
-    cv.w_bead_xlo.value = 2.2
-    assert cv._bead_sample is sampled  # drawn once, reused as the gate moves
-
-    exact = int(cv.bead_mask().sum())
-    reported = int(cv.w_bead_status.value.split()[0].replace(",", ""))
-    assert reported == pytest.approx(exact, rel=0.15)
-
-    # Applying the gate is exact, over every event, and says so.
-    cv._apply_bead_gate()
-    assert "est." not in cv.w_bead_status.value
-    assert int(cv.adata.obs["bead"].sum()) == exact
-
-
-def test_small_data_is_counted_exactly(cytof, make_napari_viewer):
-    from cytopy.viewer import CytoViewer
-
-    cv = CytoViewer(cytof, bins=128, viewer=make_napari_viewer())
-    cv._bead_channel_changed()
-    cv.w_bead_xlo.value = 2.1
-    assert cv._bead_sample is cv.adata  # 40k events: no need to subsample
-    assert "est." not in cv.w_bead_status.value
 
 
 # --------------------------------------------------------------------------
@@ -344,7 +219,7 @@ def test_decorations_flip_with_the_background(demo, make_napari_viewer):
     from cytopy.viewer import CytoViewer
 
     cytopy = __import__("cytopy")
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     cv = CytoViewer(demo, layer="asinh", bins=64, viewer=make_napari_viewer())
 
     def text_colour():
@@ -370,7 +245,7 @@ def test_background_can_be_changed_from_the_widget(cv):
 def test_a_custom_background_is_accepted_and_nonsense_is_not(demo, make_napari_viewer):
     from cytopy.viewer import CytoViewer
 
-    __import__("cytopy").asinh_transform(demo, 150.0)
+    __import__("cytopy").asinh_transform(demo, 150.0, layer="X", inplace=True)
     cv = CytoViewer(demo, layer="asinh", bins=64, background="#f5f5f5", viewer=make_napari_viewer())
     assert cv.background == "#f5f5f5"
     assert "#f5f5f5" in list(cv.w_background.choices)
@@ -459,9 +334,9 @@ def test_viewer_opens_on_several_samples(demo, demo_path, make_napari_viewer):
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     second = cytopy.read_fcs(demo_path, sample_id="run2")
-    cytopy.asinh_transform(second, 150.0)
+    cytopy.asinh_transform(second, 150.0, layer="X", inplace=True)
 
     cv = CytoViewer(
         [demo, second],
@@ -610,10 +485,10 @@ def pair(demo, demo_path, make_napari_viewer):
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     dim = cytopy.read_fcs(demo_path, sample_id="dim")
     dim.X = dim.X * np.float32(0.4)
-    cytopy.asinh_transform(dim, 150.0)
+    cytopy.asinh_transform(dim, 150.0, layer="X", inplace=True)
     return CytoViewer(
         [demo, dim], layer="asinh", x="CD3", y="CD19", bins=128, viewer=make_napari_viewer()
     )
@@ -1026,12 +901,12 @@ def three(demo, demo_path, make_napari_viewer):
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     parts = [demo]
     for name, factor in (("b", 0.6), ("c", 0.3)):
         other = cytopy.read_fcs(demo_path, sample_id=name)
         other.X = other.X * np.float32(factor)
-        cytopy.asinh_transform(other, 150.0)
+        cytopy.asinh_transform(other, 150.0, layer="X", inplace=True)
         parts.append(other)
     cv = CytoViewer(parts, layer="asinh", x="CD3", y="CD19", bins=128, viewer=make_napari_viewer())
     cv.set_plot(kind="histogram")
@@ -1142,7 +1017,7 @@ def test_gates_are_loaded_when_the_data_is_opened_again(demo, make_napari_viewer
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     first = CytoViewer(demo, layer="asinh", x="CD3", y="CD19", bins=64, viewer=make_napari_viewer())
     first.gates.add_polygons([_rect(first, 2.0, 9.0, -2.0, 9.0)])
     first.apply_gate("cells")
@@ -1158,16 +1033,56 @@ def test_gates_are_loaded_when_the_data_is_opened_again(demo, make_napari_viewer
     assert int(demo.obs["cells"].sum()) == n  # unchanged by the round trip
 
 
-def test_gate_reports_what_was_already_there(demo, make_napari_viewer, capsys):
+@pytest.fixture
+def on_fixture_window(make_napari_viewer, monkeypatch):
+    """Let ``open_napari`` build on the test window instead of its own.
+
+    It normally calls ``napari.Viewer()`` itself, which re-registers the
+    plugin actions and trips over napari's own fixture. Everything else about
+    the function runs for real.
+    """
+    import napari
+
+    import cytopy.viewer as viewer_module
+
+    window = make_napari_viewer()
+    monkeypatch.setattr(napari, "Viewer", lambda **kwargs: window)
+    yield window
+    viewer_module._CURRENT = None
+
+
+def test_open_napari_returns_the_data_not_the_window(demo, on_fixture_window, capsys):
     import cytopy
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     cytopy.add_gate(demo, "earlier", np.ones(demo.n_obs, dtype=bool))
-    out = cytopy.gate(demo, layer="asinh", block=False, viewer=make_napari_viewer())
-    assert out is demo
+
+    out = cytopy.open_napari(demo, "asinh", block=False)
+    assert out is demo  # the data, not the viewer
+    assert cytopy.current_viewer() is not None
+    assert cytopy.current_viewer().adata is demo
+    assert capsys.readouterr().out == ""  # silent unless asked
+
+
+def test_open_napari_reports_gates_when_verbose(demo, on_fixture_window, capsys):
+    import cytopy
+
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
+    cytopy.add_gate(demo, "earlier", np.ones(demo.n_obs, dtype=bool))
+    cytopy.open_napari(demo, "asinh", block=False, verbose=True)
     printed = capsys.readouterr().out
     assert "loaded 1 gate(s): earlier" in printed
     assert "gated: nothing new" in printed
+
+
+def test_open_napari_takes_names_for_several_objects(demo, on_fixture_window):
+    """The names bug: gate() used to resolve them twice and raise."""
+    import cytopy
+
+    other = demo.copy()
+    out = cytopy.open_napari([demo, other], "raw", names=["A", "B"], block=False)
+    assert sorted(out.obs["sample"].astype(str).unique()) == ["A", "B"]
+    assert out.n_obs == demo.n_obs * 2
 
 
 # --------------------------------------------------------------------------
@@ -1179,9 +1094,9 @@ def pooled(demo, demo_path, make_napari_viewer):
     import cytopy
     from cytopy.viewer import CytoViewer
 
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     other = cytopy.read_fcs(demo_path, sample_id="b")
-    cytopy.asinh_transform(other, 150.0)
+    cytopy.asinh_transform(other, 150.0, layer="X", inplace=True)
     return CytoViewer(
         {"a": demo, "b": other},
         layer="asinh",
@@ -1247,3 +1162,40 @@ def test_splitting_back_out_keeps_the_gates(pooled):
         assert int(part.obs["positive"].sum()) > 0
         assert not (part.obs["positive"] & ~part.obs["singlets"]).any()
         assert sorted(part.uns["cytopy"]["gates"]) == ["positive", "singlets"]
+
+
+def test_open_napari_can_start_on_chosen_channels(demo, on_fixture_window):
+    """x/y are a starting point; the window owns them afterwards."""
+    import cytopy
+
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
+    cytopy.open_napari(demo, "asinh", x="CD3", y="CD19", block=False)
+
+    cv = cytopy.current_viewer()
+    assert (cv.panel.x, cv.panel.y) == ("CD3 (FITC-A)", "CD19 (PE-A)")
+    assert (cv.w_x.value, cv.w_y.value) == ("CD3 (FITC-A)", "CD19 (PE-A)")
+
+
+def test_open_napari_can_start_on_one_sample(demo, on_fixture_window):
+    import cytopy
+
+    other = demo.copy()
+    cytopy.open_napari([demo, other], "raw", names=["A", "B"], samples=["B"], block=False)
+
+    cv = cytopy.current_viewer()
+    assert cv.panel.samples == ("B",)
+    assert list(cv.w_samples.value) == ["B"]
+    # only that sample's events are in scope
+    labels = cv.adata.obs["sample"].astype(str).to_numpy()
+    assert int(cv.selection_mask().sum()) == int((labels == "B").sum())
+
+
+def test_open_napari_defaults_show_everything(demo, on_fixture_window):
+    import cytopy
+
+    other = demo.copy()
+    cytopy.open_napari([demo, other], "raw", names=["A", "B"], block=False)
+
+    cv = cytopy.current_viewer()
+    assert cv.panel.samples == ()
+    assert int(cv.selection_mask().sum()) == cv.adata.n_obs

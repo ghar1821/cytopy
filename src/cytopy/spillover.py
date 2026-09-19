@@ -5,7 +5,7 @@ There are three ways to get a matrix, in increasing order of effort:
 * the acquisition software already computed one and wrote it into the FCS
   file, where :func:`~cytopy.read_fcs` picks it up as ``adata.uns['spillover']``;
 * some other program exported one, and :func:`read_spillover` reads its CSV;
-* you have the single-stain controls, and :func:`spillover_from_controls`
+* you have the single-stain controls, and :func:`compute_spillover_matrix`
   computes one from them by the Bagwell and Adams method.
 
 All three produce the same thing: a square DataFrame indexed by detector, with
@@ -25,14 +25,15 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 
+from ._util import layer_matrix
 from .transforms import channel_index, fluor_channels
 
 __all__ = [
-    "compensate_controls",
+    "compensate",
     "compensation_residuals",
+    "compute_spillover_matrix",
     "read_controls",
     "read_spillover",
-    "spillover_from_controls",
     "subset_controls",
     "write_spillover",
 ]
@@ -187,7 +188,7 @@ def write_spillover(spillover: pd.DataFrame, path: str | os.PathLike) -> Path:
     Parameters
     ----------
     spillover
-        Square matrix, as returned by :func:`spillover_from_controls` or
+        Square matrix, as returned by :func:`compute_spillover_matrix` or
         :func:`read_spillover`.
     path
         File to write.
@@ -270,12 +271,12 @@ def _stat(values: np.ndarray, statistic: str) -> np.ndarray:
     raise ValueError(f"statistic must be 'median' or 'mean', not {statistic!r}")
 
 
-def spillover_from_controls(
+def compute_spillover_matrix(
     controls: Mapping[str, ad.AnnData | str | os.PathLike],
     *,
     unstained: ad.AnnData | str | os.PathLike | None = None,
     channels: Sequence[str] | None = None,
-    layer: str | None = None,
+    layer: str = "raw",
     statistic: str = "median",
     positive_gate: str | None = None,
     thresholds: Mapping[str, float] | None = None,
@@ -315,7 +316,8 @@ def spillover_from_controls(
         larger set is allowed — the extra detectors get identity rows, which
         asserts they spill into nothing.
     layer
-        Layer of each control to measure. ``None`` uses ``.X``.
+        Layer of each control to measure, by name. Defaults to ``"raw"``:
+        a matrix is derived from the values as acquired.
     statistic
         ``"median"`` (default, robust) or ``"mean"`` (as in the original
         paper). Applied to both populations.
@@ -500,7 +502,7 @@ def read_controls(
     -------
     tuple
         ``(controls, unstained)`` — a mapping from detector name to its
-        control, ready for :func:`spillover_from_controls`, and the unstained
+        control, ready for :func:`compute_spillover_matrix`, and the unstained
         sample if one was found (``None`` otherwise).
 
     Raises
@@ -618,38 +620,108 @@ def subset_controls(
     return out
 
 
-def compensate_controls(
-    controls: Mapping[str, ad.AnnData | str | os.PathLike],
-    spillover: pd.DataFrame | np.ndarray | str | os.PathLike,
+def compensate(
+    adata: ad.AnnData,
+    spillover: pd.DataFrame | np.ndarray | str | os.PathLike | None = None,
     *,
+    layer: str = "raw",
     key_added: str = "comp",
-    layer: str | None = None,
-) -> dict[str, ad.AnnData]:
-    """Apply a matrix to every single-stain control.
+    inplace: bool = False,
+) -> ad.AnnData:
+    """Apply the spillover matrix, undoing fluorescence crosstalk between detectors.
+
+    Compensated values are ``X @ inv(S)``.
 
     Parameters
     ----------
-    controls
-        Maps detector to its control, as :func:`read_controls` returns.
+    adata
+        Cytometry AnnData.
     spillover
-        The matrix to try, in any form :func:`~cytopy.compensate` accepts.
-    key_added
-        Layer each control's compensated values are written to.
+        Square spillover matrix, in any of the forms cytopy can get one:
+
+        * ``None`` (default) uses ``adata.uns['spillover']``, which
+          :func:`~cytopy.read_fcs` parses from the file's ``$SPILLOVER``;
+        * a DataFrame, whose index/columns name the detectors and need only
+          cover a subset of the channels — as returned by
+          :func:`~cytopy.compute_spillover_matrix`, which derives one from
+          single-stain controls;
+        * a path to a CSV exported by other software, read with
+          :func:`~cytopy.read_spillover`;
+        * a bare array, assumed to be in :func:`fluor_channels` order.
     layer
-        Input layer. ``None`` uses ``.X``, which is where the raw counts are.
+        Input layer to read from, by name. Defaults to ``"raw"``: compensation
+        undoes crosstalk in the values as acquired, so it belongs on the
+        untouched matrix rather than on whatever has been done since.
+    key_added
+        Layer to write the compensated matrix to.
+    inplace
+        Modify ``adata`` and return it. The default is ``False``: the original
+        is left alone and a modified copy is returned, so a call that is not
+        assigned to anything cannot quietly change the data underneath you.
 
     Returns
     -------
-    dict
-        The controls, each with the compensated matrix in
-        ``layers[key_added]``.
-    """
-    from .transforms import compensate
+    AnnData
+        The annotated object, with the compensated matrix in
+        ``adata.layers[key_added]`` and where the matrix came from in
+        ``adata.uns['cytopy']['spillover_source']``. Channels absent from the
+        matrix are copied through untouched.
 
-    loaded = {key: _as_anndata(value) for key, value in controls.items()}
-    for adata in loaded.values():
-        compensate(adata, spillover, layer=layer, key_added=key_added)
-    return loaded
+    Raises
+    ------
+    ValueError
+        If no matrix is given and the file recorded none, if the matrix is not
+        square, if its rows and columns do not name the same detectors, or if
+        it cannot be inverted.
+    """
+    adata = adata if inplace else adata.copy()
+    source = "argument"
+    if spillover is None:
+        spillover = adata.uns.get("spillover")
+        source = "uns"
+    if spillover is None:
+        raise ValueError("no spillover matrix given and none found in adata.uns['spillover']")
+    if isinstance(spillover, str | os.PathLike):
+        source = f"csv:{spillover}"
+        spillover = read_spillover(spillover)
+    if not isinstance(spillover, pd.DataFrame):
+        names = fluor_channels(adata)
+        values = np.asarray(spillover, dtype=float)
+        if values.ndim != 2 or values.shape[0] != values.shape[1]:
+            raise ValueError(f"spillover must be a square matrix, got shape {values.shape}")
+        if values.shape[0] != len(names):
+            raise ValueError(
+                f"spillover is {values.shape[0]}x{values.shape[1]} but there are "
+                f"{len(names)} fluorescence channels; pass a DataFrame to name them"
+            )
+        spillover = pd.DataFrame(values, index=names, columns=names)
+    if spillover.shape[0] != spillover.shape[1]:
+        raise ValueError(f"spillover must be square, got shape {spillover.shape}")
+
+    # Rows and columns must describe the same detectors, but need not list them
+    # in the same order (or under the same alias), so resolve both and align.
+    cols = [channel_index(adata, c) for c in spillover.columns]
+    rows = [channel_index(adata, r) for r in spillover.index]
+    if sorted(rows) != sorted(cols):
+        raise ValueError(
+            f"spillover rows {list(spillover.index)} and columns {list(spillover.columns)} "
+            "do not name the same detectors"
+        )
+    if rows != cols:
+        spillover = spillover.iloc[[rows.index(c) for c in cols]]
+
+    X = np.asarray(layer_matrix(adata, layer), dtype=np.float64)
+    out = X.copy()
+    try:
+        inv = np.linalg.inv(spillover.to_numpy(dtype=float))
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"spillover matrix is singular and cannot be inverted: {exc}") from exc
+    out[:, cols] = X[:, cols] @ inv
+    adata.layers[key_added] = out.astype(adata.X.dtype, copy=False)
+    cytopy_uns = adata.uns.setdefault("cytopy", {})
+    cytopy_uns["compensated_layer"] = key_added
+    cytopy_uns["spillover_source"] = source
+    return adata
 
 
 def compensation_residuals(
@@ -676,7 +748,7 @@ def compensation_residuals(
     spillover
         The matrix to test.
     **kwargs
-        Passed to :func:`spillover_from_controls` -- ``unstained``,
+        Passed to :func:`compute_spillover_matrix` -- ``unstained``,
         ``positive_gate``, ``thresholds``, ``statistic`` and the rest, which
         should match what the matrix was built with.
 
@@ -686,13 +758,13 @@ def compensation_residuals(
         Square, indexed and columned by detector, zero where the matrix is
         right.
     """
-    compensated = compensate_controls(controls, spillover, key_added="_residual")
+    compensated = {key: _as_anndata(value) for key, value in controls.items()}
+    for control in compensated.values():
+        compensate(control, spillover, key_added="_residual", inplace=True)
     if "unstained" in kwargs and kwargs["unstained"] is not None:
-        from .transforms import compensate
-
         kwargs = dict(kwargs)
         kwargs["unstained"] = compensate(
-            _as_anndata(kwargs["unstained"]), spillover, key_added="_residual", copy=True
+            _as_anndata(kwargs["unstained"]), spillover, key_added="_residual"
         )
-    out = spillover_from_controls(compensated, layer="_residual", **kwargs)
+    out = compute_spillover_matrix(compensated, layer="_residual", **kwargs)
     return out - np.eye(out.shape[0])

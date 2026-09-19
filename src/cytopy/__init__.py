@@ -2,118 +2,94 @@
 
 from __future__ import annotations
 
-from .beads import (
-    BEAD_PANELS,
-    bead_baseline,
-    bead_channels,
-    bead_distance,
-    bead_gates,
-    dna_channel,
-    gate_beads,
-    mass_channels,
-    normalise_beads,
-    plot_bead_gates,
-    plot_beads_over_time,
-    remove_beads,
-)
-from .debarcode import (
-    BARCODE_SCHEMES,
-    apply_cutoffs,
-    assign_prelim,
-    barcode_key,
-    barcode_stats,
-    debarcode,
-    estimate_cutoffs,
-    plot_barcode_events,
-    plot_yields,
-)
-from .density import Axes2D, density_image
+from .density import Axes2D, density_curve, density_image
 from .filters import filter_events, filter_log, record_filter
 from .gating import (
+    GateRecord,
     add_gate,
+    ellipse_mask,
     gate_children,
     gate_mask,
+    gate_order,
+    gate_record,
     gate_stats,
     polygon_mask,
     recompute_gates,
+    rectangle_to_polygon,
+    shapes_mask,
 )
 from .io import concat_samples, read_fcs, read_fcs_dir, split_samples
 from .plotting import plot_biaxial, plot_compensation, plot_gate
 from .report import gating_pdf, report
-from .scales import AsinhScale, LinearScale, LogicleScale, LogScale, get_scale
+from .scales import (
+    AsinhScale,
+    LinearScale,
+    LogicleScale,
+    LogScale,
+    PretransformedScale,
+    Scale,
+    get_scale,
+)
 from .spillover import (
-    compensate_controls,
+    compensate,
     compensation_residuals,
+    compute_spillover_matrix,
     read_controls,
     read_spillover,
-    spillover_from_controls,
     subset_controls,
     write_spillover,
 )
 from .transforms import (
     asinh_transform,
     channel_index,
-    compensate,
     estimate_cofactors,
     fluor_channels,
     logicle_transform,
     subsample,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.0.1-alpha"
 
 __all__ = [
-    "BARCODE_SCHEMES",
-    "BEAD_PANELS",
     "AsinhScale",
     "Axes2D",
     "CytoViewer",
+    "GateRecord",
     "LinearScale",
     "LogScale",
     "LogicleScale",
     "Panel",
+    "PretransformedScale",
+    "Scale",
     "add_gate",
-    "apply_cutoffs",
     "as_one_anndata",
     "asinh_transform",
-    "assign_prelim",
-    "barcode_key",
-    "barcode_stats",
-    "bead_baseline",
-    "bead_channels",
-    "bead_distance",
-    "bead_gates",
     "channel_index",
     "compensate",
-    "compensate_controls",
     "compensation_residuals",
+    "compute_spillover_matrix",
     "concat_samples",
-    "debarcode",
+    "current_viewer",
+    "density_curve",
     "density_image",
-    "dna_channel",
+    "ellipse_mask",
     "estimate_cofactors",
-    "estimate_cutoffs",
     "faded_colormap",
     "filter_events",
     "filter_log",
     "fluor_channels",
-    "gate",
-    "gate_beads",
     "gate_children",
     "gate_mask",
+    "gate_order",
+    "gate_record",
     "gate_stats",
     "gating_pdf",
     "get_scale",
     "logicle_transform",
-    "mass_channels",
-    "normalise_beads",
-    "plot_barcode_events",
-    "plot_bead_gates",
-    "plot_beads_over_time",
+    "open_napari",
     "plot_biaxial",
     "plot_compensation",
     "plot_gate",
-    "plot_yields",
     "polygon_mask",
     "read_controls",
     "read_fcs",
@@ -121,20 +97,32 @@ __all__ = [
     "read_spillover",
     "recompute_gates",
     "record_filter",
-    "remove_beads",
+    "rectangle_to_polygon",
     "report",
-    "spillover_from_controls",
+    "shapes_mask",
     "split_samples",
     "subsample",
     "subset_controls",
-    "view",
     "write_spillover",
 ]
 
 
+#: Names served from :mod:`cytopy.viewer`, which pulls in napari and Qt. Listed
+#: here rather than read off ``viewer.__all__`` because importing the module to
+#: find out would defeat the point; ``tests/test_api.py`` checks the two agree.
+_LAZY = (
+    "CytoViewer",
+    "Panel",
+    "as_one_anndata",
+    "current_viewer",
+    "faded_colormap",
+    "open_napari",
+)
+
+
 def __getattr__(name: str):
     # napari (and Qt) are heavy and optional: import them only on first use.
-    if name in ("view", "gate", "CytoViewer", "Panel", "faded_colormap", "as_one_anndata"):
+    if name in _LAZY:
         from . import viewer as _viewer
 
         return getattr(_viewer, name)

@@ -18,7 +18,7 @@ def test_raw_layer_is_an_untouched_copy(demo):
     assert np.array_equal(demo.layers["raw"], demo.X)
     assert demo.layers["raw"] is not demo.X
     before = demo.layers["raw"].copy()
-    cytopy.asinh_transform(demo, 150.0, key_added=None)  # overwrites .X
+    cytopy.asinh_transform(demo, 150.0, layer="X", key_added=None, inplace=True)  # overwrites .X
     assert np.array_equal(demo.layers["raw"], before)
     assert not np.array_equal(demo.X[:, 2], before[:, 2])
 
@@ -59,6 +59,8 @@ def test_compensate_recovers_the_uncontaminated_signal(demo):
         demo.uns["spillover"].__class__(
             spill, index=cytopy.fluor_channels(demo), columns=cytopy.fluor_channels(demo)
         ),
+        layer="X",  # the contamination above was written to .X, not to layers["raw"]
+        inplace=True,
     )
     assert np.allclose(demo.layers["comp"][:, fluor], truth, rtol=1e-3, atol=1e-2)
     # Channels outside the matrix pass straight through.
@@ -66,13 +68,13 @@ def test_compensate_recovers_the_uncontaminated_signal(demo):
 
 
 def test_compensate_uses_the_spillover_from_the_file(demo):
-    cytopy.compensate(demo)
+    cytopy.compensate(demo, inplace=True)
     assert "comp" in demo.layers
     assert demo.uns["cytopy"]["compensated_layer"] == "comp"
 
 
 def test_asinh_transform_scalar_cofactor(demo):
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     out = demo.layers["asinh"]
     assert np.allclose(out[:, 2], np.arcsinh(demo.X[:, 2] / 150.0), atol=1e-5)
     # scatter and time are copied through untransformed
@@ -82,14 +84,14 @@ def test_asinh_transform_scalar_cofactor(demo):
 
 
 def test_asinh_transform_per_channel_cofactor(demo):
-    cytopy.asinh_transform(demo, {"CD3": 10.0, "default": 500.0})
+    cytopy.asinh_transform(demo, {"CD3": 10.0, "default": 500.0}, layer="X", inplace=True)
     assert demo.var["cofactor"].iloc[2] == 10.0
     assert demo.var["cofactor"].iloc[3] == 500.0
 
 
 def test_asinh_transform_chains_off_a_layer(demo):
-    cytopy.compensate(demo)
-    cytopy.asinh_transform(demo, 150.0, layer="comp")
+    cytopy.compensate(demo, inplace=True)
+    cytopy.asinh_transform(demo, 150.0, layer="comp", inplace=True)
     assert np.allclose(
         demo.layers["asinh"][:, 2], np.arcsinh(demo.layers["comp"][:, 2] / 150.0), atol=1e-5
     )
@@ -97,19 +99,19 @@ def test_asinh_transform_chains_off_a_layer(demo):
 
 def test_asinh_in_place_overwrites_X(demo):
     before = demo.X.copy()
-    cytopy.asinh_transform(demo, 150.0, key_added=None)
+    cytopy.asinh_transform(demo, 150.0, layer="X", key_added=None, inplace=True)
     assert not np.allclose(demo.X[:, 2], before[:, 2])
     assert [k for k in demo.layers if k is not None] == ["raw"]
 
 
-def test_estimate_cofactors(demo):
-    cof = cytopy.estimate_cofactors(demo)
+def test_estimate_cofactors(demo, layer="X"):
+    cof = cytopy.estimate_cofactors(demo, layer="X")
     assert set(cof) == set(cytopy.fluor_channels(demo))
     assert all(v > 1 for v in cof.values())
 
 
 def test_logicle_transform_maps_into_unit_interval(demo):
-    cytopy.logicle_transform(demo)
+    cytopy.logicle_transform(demo, layer="X", inplace=True)
     out = demo.layers["logicle"][:, 2]
     assert out.min() >= -0.21 and out.max() <= 1.21
     assert demo.uns["cytopy"]["logicle_params"]["CD3 (FITC-A)"]["M"] == 4.5
@@ -122,7 +124,7 @@ def test_subsample(demo):
 
 
 def test_h5ad_roundtrip(demo, tmp_path):
-    cytopy.asinh_transform(demo, 150.0)
+    cytopy.asinh_transform(demo, 150.0, layer="X", inplace=True)
     demo.uns.pop("spillover")
     p = tmp_path / "demo.h5ad"
     demo.write_h5ad(p)
@@ -134,17 +136,17 @@ def test_h5ad_roundtrip(demo, tmp_path):
 
 def test_transforming_twice_keeps_both_layers_labelled(demo):
     """Raw and compensated, say. One slot meant the first lost its raw-unit ticks."""
-    cytopy.compensate(demo)
-    cytopy.logicle_transform(demo, layer="raw", key_added="logicle")
-    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle")
+    cytopy.compensate(demo, inplace=True)
+    cytopy.logicle_transform(demo, layer="raw", key_added="logicle", inplace=True)
+    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle", inplace=True)
 
     info = demo.uns["cytopy"]
     assert set(info["logicle_layers"]) == {"logicle", "comp_logicle"}
     for layer in ("logicle", "comp_logicle"):
         assert "CD3 (FITC-A)" in info["logicle_layers"][layer]
 
-    cytopy.asinh_transform(demo, 150.0, key_added="a1")
-    cytopy.asinh_transform(demo, 5.0, key_added="a2")
+    cytopy.asinh_transform(demo, 150.0, layer="X", key_added="a1", inplace=True)
+    cytopy.asinh_transform(demo, 5.0, layer="X", key_added="a2", inplace=True)
     assert info["asinh_layers"]["a1"]["CD3 (FITC-A)"] == 150.0
     assert info["asinh_layers"]["a2"]["CD3 (FITC-A)"] == 5.0
 
@@ -153,9 +155,9 @@ def test_both_layers_get_raw_unit_ticks(demo):
     from cytopy.plotting import axis_scale
     from cytopy.scales import PretransformedScale
 
-    cytopy.compensate(demo)
-    cytopy.logicle_transform(demo, layer="raw", key_added="logicle")
-    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle")
+    cytopy.compensate(demo, inplace=True)
+    cytopy.logicle_transform(demo, layer="raw", key_added="logicle", inplace=True)
+    cytopy.logicle_transform(demo, layer="comp", key_added="comp_logicle", inplace=True)
     for layer in ("logicle", "comp_logicle"):
         assert isinstance(axis_scale(demo, "CD3", layer), PretransformedScale)
 

@@ -1,3 +1,4 @@
+import contextlib
 import sys
 from pathlib import Path
 
@@ -46,51 +47,6 @@ def controls(controls_dir):
     return cytopy.read_controls(controls_dir)
 
 
-@pytest.fixture(scope="session")
-def cytof_path(tmp_path_factory):
-    """A synthetic mass cytometry file: EQ beads, DNA, and sensitivity drift."""
-    from make_demo_cytof import main
-
-    path = tmp_path_factory.mktemp("cytof") / "demo_cytof.fcs"
-    main(str(path))
-    return path
-
-
-@pytest.fixture
-def cytof(cytof_path):
-    import cytopy
-
-    return cytopy.read_fcs(cytof_path)
-
-
-@pytest.fixture(scope="session")
-def barcoded_path(tmp_path_factory):
-    """Synthetic CyTOF with a 3-of-6 palladium barcode, beads, drift and doublets."""
-    from make_demo_cytof import write_barcoded
-
-    path = tmp_path_factory.mktemp("barcoded") / "demo_barcoded.fcs"
-    write_barcoded(str(path))
-    return path
-
-
-@pytest.fixture(scope="session")
-def barcoded_truth(barcoded_path, tmp_path_factory):
-    """The barcode each event really carries; "0" for beads and doublets."""
-    import sys
-
-    from make_demo_cytof import make_barcoded_events
-
-    del sys
-    return make_barcoded_events(60_000)[3]
-
-
-@pytest.fixture
-def barcoded(barcoded_path):
-    import cytopy
-
-    return cytopy.read_fcs(barcoded_path)
-
-
 @pytest.fixture(autouse=True)
 def _close_figures():
     """Plot functions hand back open figures; the caller closes them, so do we."""
@@ -100,3 +56,24 @@ def _close_figures():
     except ImportError:  # pragma: no cover
         return
     plt.close("all")
+
+
+@pytest.fixture(autouse=True)
+def _close_open_napari_window():
+    """Shut any window ``open_napari`` left behind.
+
+    It deliberately holds a module-level reference so a non-blocking call in a
+    notebook does not let the window be collected. Left in place between tests
+    that is a leaked Qt object, which napari's own fixture rightly complains
+    about.
+    """
+    yield
+    try:
+        from cytopy import viewer
+    except ImportError:  # pragma: no cover - napari not installed
+        return
+    current = getattr(viewer, "_CURRENT", None)
+    if current is not None:
+        viewer._CURRENT = None
+        with contextlib.suppress(Exception):
+            current.viewer.close()

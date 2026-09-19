@@ -25,6 +25,28 @@ __all__ = [
 _LN10 = np.log(10.0)
 
 
+def pad_range(lo: float, hi: float, frac: float = 0.02) -> tuple[float, float]:
+    """Widen a range slightly so points on the limit are not clipped by the frame.
+
+    Parameters
+    ----------
+    lo, hi
+        The range to pad. A degenerate or non-finite range becomes a unit-wide
+        one around ``lo``, because an axis has to have some extent.
+    frac
+        Fraction of the span to add at each end.
+
+    Returns
+    -------
+    tuple of float
+        The padded ``(lo, hi)``.
+    """
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = lo - 0.5, lo + 0.5
+    pad = frac * (hi - lo)
+    return (lo - pad, hi + pad)
+
+
 @dataclass
 class Ticks:
     """Where an axis's ticks go, in *display* coordinates.
@@ -134,10 +156,7 @@ class Scale:
             return (0.0, 1.0)
         lo = float(np.quantile(s, quantiles[0])) if quantiles[0] > 0 else float(s.min())
         hi = float(np.quantile(s, quantiles[1])) if quantiles[1] < 1 else float(s.max())
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            lo, hi = lo - 0.5, lo + 0.5
-        pad = 0.02 * (hi - lo)
-        return (lo - pad, hi + pad)
+        return pad_range(lo, hi)
 
 
 # --------------------------------------------------------------------------
